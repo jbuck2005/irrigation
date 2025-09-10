@@ -1,148 +1,157 @@
-/*
- * mcp23017.c                                                                                     // Implementation of MCP23017 irrigation helpers
+/**
+ * @file mcp23017.c
+ * @author James Buck
+ * @date September 10, 2025
+ * @brief Driver for the MCP23017 I2C I/O expander for an irrigation system.
  *
- * This file isolates all MCP23017-specific logic so that both irrigation.c                        //
- * (stand-alone tool) and irrigationd.c (daemon) share the same trusted code.                      //
+ * @description
+ * This file provides a hardware abstraction layer for the MCP23017. It handles low-level I2C communication, configuration,
+ * and the specific logic for mapping irrigation zones to the expander's GPIO pins.
  *
- * Features:                                                                                      // - I²C open/close, read/write
- *                                                                                                // - Configure all pins as outputs
- *                                                                                                // - Zone mapping 1..14 → MCP register/bit
- *                                                                                                // - Set zone state with optional thread safety
- *                                                                                                // - Debug + syslog integration for visibility
+ * It is designed to be shared by both standalone tools and daemons, ensuring consistent hardware control.
+ * Features include optional thread-safety via an external mutex and syslog integration for robust logging.
  */
 
-#include <stdio.h>                                                                                // fprintf, perror
-#include <stdlib.h>                                                                               // exit
-#include <stdint.h>                                                                               // uint8_t
-#include <unistd.h>                                                                               // read, write, close
-#include <fcntl.h>                                                                                // open
-#include <errno.h>                                                                                // errno
-#include <string.h>                                                                               // strerror
-#include <sys/ioctl.h>                                                                            // ioctl
-#include <linux/i2c-dev.h>                                                                        // I²C definitions
-#include <pthread.h>                                                                              // pthread_mutex_t
-#include <syslog.h>                                                                               // syslog logging
+#include <stdio.h>                                                              // Provides standard I/O functions like fprintf and perror
+#include <stdlib.h>                                                             // Provides general utilities like exit()
+#include <stdint.h>                                                             // Provides fixed-width integer types like uint8_t for precise control
+#include <unistd.h>                                                             // Provides POSIX operating system API, including read, write, and close
+#include <fcntl.h>                                                              // Provides file control options, used here for open()
+#include <errno.h>                                                              // Provides access to the global `errno` variable for error reporting
+#include <string.h>                                                             // Provides string-handling functions, especially strerror to get error messages
+#include <sys/ioctl.h>                                                          // Provides the ioctl function for device-specific control operations
+#include <linux/i2c-dev.h>                                                      // Provides the I2C-specific definitions and constants for ioctl
+#include <pthread.h>                                                            // Provides POSIX threads functions for multi-threading support (mutex)
+#include <syslog.h>                                                             // Provides functions for logging messages to the system logger
 
-#include "mcp23017.h"                                                                             // Public header
+#include "mcp23017.h"                                                           // Includes the public declarations for this driver module
 
-// ------------------------------ Globals --------------------------------------------------------
+/* --- Global State --- */
 
-static int g_fd = -1;                                                                             // I²C file descriptor (active bus handle)
-static pthread_mutex_t *g_mutex = NULL;                                                           // Optional external mutex for thread safety
-static uint8_t g_debug = 0;                                                                       // Debug flag (set manually or via env)
+// `static` variables are private to this file, a good practice for encapsulation.
+static int g_fd = -1;                                                           // File descriptor for the I2C bus; -1 indicates it's not open.
+static pthread_mutex_t *g_mutex = NULL;                                         // Pointer to an external mutex, enabling optional thread safety.
+static uint8_t g_debug = 0;                                                     // A flag to enable or disable verbose debug logging.
 
-// ------------------------------ I²C helpers ----------------------------------------------------
-
-int mcp_i2c_open(const char *devnode) {                                                           // Open I²C bus and select MCP23017
-    g_fd = open(devnode, O_RDWR);                                                                 // Open char device
-    if (g_fd < 0) {                                                                               // Error check
-        perror("open(i2c)");                                                                      // Log to stderr
-        syslog(LOG_ERR, "open(%s): %s", devnode, strerror(errno));                                // Log to syslog
-        return -1;                                                                                // Fail
+int mcp_i2c_open(const char *devnode) {
+    g_fd = open(devnode, O_RDWR);                                               // Open the specified I2C device file (e.g., "/dev/i2c-1") for reading and writing.
+    if (g_fd < 0) {                                                             // System calls return -1 on error, so we must always check the result.
+        perror("open(i2c)");                                                    // perror() prints a user-friendly error message to stderr based on `errno`.
+        syslog(LOG_ERR, "Failed to open I2C bus %s: %s", devnode, strerror(errno));// syslog() sends a structured message to the system log for robust diagnostics.
+        return -1;                                                              // Return a failure code to the caller.
     }
-    if (ioctl(g_fd, I2C_SLAVE, MCPADDR) < 0) {                                                    // Set slave address
-        perror("ioctl(I2C_SLAVE)");                                                               // Log to stderr
-        syslog(LOG_ERR, "ioctl(I2C_SLAVE 0x%02x): %s", MCPADDR, strerror(errno));                  // Log to syslog
-        close(g_fd);                                                                              // Cleanup
-        g_fd = -1;                                                                                // Invalidate
-        return -1;                                                                                // Fail
+
+    // After opening the bus, we must specify which slave device we want to talk to.
+    if (ioctl(g_fd, I2C_SLAVE, MCPADDR) < 0) {                                  // `ioctl` performs device-specific commands. I2C_SLAVE sets the target address.
+        perror("ioctl(I2C_SLAVE)");                                             // Log the error if we can't set the slave address.
+        syslog(LOG_ERR, "Failed to set I2C slave address 0x%02x: %s", MCPADDR, strerror(errno));
+        close(g_fd);                                                            // It's crucial to clean up (close the file) if a step fails.
+        g_fd = -1;                                                              // Reset the global file descriptor to its initial invalid state.
+        return -1;                                                              // Propagate the failure.
     }
-    return 0;                                                                                     // Success
+    return 0;                                                                   // Return 0 to indicate success.
 }
 
-void mcp_i2c_close(void) {                                                                        // Close I²C device
-    if (g_fd >= 0) close(g_fd);                                                                   // Close fd if valid
-    g_fd = -1;                                                                                    // Invalidate
+void mcp_i2c_close(void) {
+    if (g_fd >= 0) {                                                            // Only attempt to close the file if the descriptor is valid.
+        close(g_fd);                                                            // Release the file handle.
+    }
+    g_fd = -1;                                                                  // Invalidate the global descriptor to prevent accidental reuse.
 }
 
-static int mcp_write(uint8_t reg, uint8_t val) {                                                  // Write one MCP register
-    uint8_t buf[2] = { reg, val };                                                                // [register, value]
-    if (write(g_fd, buf, 2) != 2) {                                                               // Must write 2 bytes
-        perror("mcp_write");                                                                      // Log to stderr
-        syslog(LOG_ERR, "mcp_write(0x%02x,0x%02x): %s", reg, val, strerror(errno));                // Log to syslog
-        return -1;                                                                                // Fail
+static int mcp_write(uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = { reg, val };                                              // An I2C write requires sending the register address followed by the data.
+    if (write(g_fd, buf, 2) != 2) {                                             // Attempt to write the 2-byte buffer to the device.
+        perror("mcp_write");                                                    // `write` should return the number of bytes written; if it's not 2, an error occurred.
+        syslog(LOG_ERR, "I2C write failed to reg 0x%02x: %s", reg, strerror(errno));
+        return -1;
     }
-    return 0;                                                                                     // Success
+    return 0;
 }
 
-static int mcp_read(uint8_t reg, uint8_t *out) {                                                  // Read one MCP register
-    if (write(g_fd, &reg, 1) != 1) {                                                              // Prime register pointer
-        perror("mcp_addr");                                                                       // Log to stderr
-        syslog(LOG_ERR, "mcp_addr(0x%02x): %s", reg, strerror(errno));                            // Log to syslog
-        return -1;                                                                                // Fail
+static int mcp_read(uint8_t reg, uint8_t *out) {
+    // An I2C read is a two-step process: first write the register address you want to read...
+    if (write(g_fd, &reg, 1) != 1) {
+        perror("mcp_read (set addr)");
+        syslog(LOG_ERR, "I2C failed to set read address to 0x%02x: %s", reg, strerror(errno));
+        return -1;
     }
-    if (read(g_fd, out, 1) != 1) {                                                                // Read back one byte
-        perror("mcp_read");                                                                       // Log to stderr
-        syslog(LOG_ERR, "mcp_read(0x%02x): %s", reg, strerror(errno));                            // Log to syslog
-        return -1;                                                                                // Fail
+
+    // ...then perform a read to get the data from that register.
+    if (read(g_fd, out, 1) != 1) {
+        perror("mcp_read (read data)");
+        syslog(LOG_ERR, "I2C read failed from reg 0x%02x: %s", reg, strerror(errno));
+        return -1;
     }
-    if (g_debug) {                                                                                // Optional debug
-        fprintf(stderr, "read[0x%02x] => 0x%02x\n", reg, *out);                                   // To stderr
-        syslog(LOG_DEBUG, "read[0x%02x] => 0x%02x", reg, *out);                                   // To syslog
+
+    if (g_debug) {                                                              // If the debug flag is set, print the transaction for visibility.
+        fprintf(stderr, "read[0x%02x] => 0x%02x\n", reg, *out);
+        syslog(LOG_DEBUG, "read[0x%02x] => 0x%02x", reg, *out);
     }
-    return 0;                                                                                     // Success
+    return 0;
 }
 
-int mcp_config_outputs(void) {                                                                    // Make all pins outputs
-    if (mcp_write(IODIRA, 0x00)) return -1;                                                       // All port A pins = outputs
-    if (mcp_write(IODIRB, 0x00)) return -1;                                                       // All port B pins = outputs
-    return 0;                                                                                     // Success
+int mcp_config_outputs(void) {
+    // IODIRA and IODIRB are the I/O Direction registers for Port A and Port B.
+    // Writing 0x00 to them configures all 8 pins on that port as outputs.
+    if (mcp_write(IODIRA, 0x00)) return -1;
+    if (mcp_write(IODIRB, 0x00)) return -1;
+    return 0;
 }
 
-// ------------------------------ Zone mapping ---------------------------------------------------
-
-int mcp_map_zone(int zone, uint8_t *reg, uint8_t *mask) {                                         // Zone → (register, bitmask)
-    if (zone >= 1 && zone <= 8) {                                                                 // Zones 1..8 → GPIOA bits 0..7
-        *reg  = GPIOA;                                                                            // Register = GPIOA
-        *mask = (uint8_t)(1u << (zone - 1));                                                      // Bitmask = bitN
-        return 0;                                                                                 // Valid
-    } else if (zone >= 9 && zone <= 14) {                                                         // Zones 9..14 → GPIOB reversed mapping
-        *reg = GPIOB;                                                                             // Register = GPIOB
-        static const uint8_t bmap[15] = {                                                         // Reverse mapping table
-            0,0,0,0,0,0,0,0,0,                                                                     // 0..8 placeholders
-            (1u<<5), (1u<<4), (1u<<3), (1u<<2), (1u<<1), (1u<<0)                                  // 9..14 → bits 5..0
+int mcp_map_zone(int zone, uint8_t *reg, uint8_t *mask) {
+    if (zone >= 1 && zone <= 8) {                                               // Zones 1 through 8 are mapped directly to the 8 pins of Port A.
+        *reg  = GPIOA;                                                          // The target register is GPIOA (the data register for Port A).
+        *mask = (uint8_t)(1u << (zone - 1));                                    // A bitmask is created by shifting '1' to the correct pin position (0-7).
+        return 0;
+    } else if (zone >= 9 && zone <= 14) {                                       // Zones 9 through 14 are mapped to a subset of pins on Port B.
+        *reg = GPIOB;                                                           // The target register is GPIOB.
+        static const uint8_t bmap[] = {                                         // A lookup table is efficient for non-linear or reversed mappings.
+            (1u << 5), (1u << 4), (1u << 3),                                    // Zone 9 -> Pin 5, Zone 10 -> Pin 4, etc.
+            (1u << 2), (1u << 1), (1u << 0)
         };
-        *mask = bmap[zone];                                                                       // Lookup bitmask
-        return (*mask == 0) ? -1 : 0;                                                             // Validate
-    } else {                                                                                      // Out of range
-        return -1;                                                                                // Invalid zone
+        *mask = bmap[zone - 9];                                                 // Calculate the index (0-5) into the map from the zone number (9-14).
+        return 0;
+    } else {
+        return -1;                                                              // If the zone is outside the valid range (1-14), return an error.
     }
 }
 
-// ------------------------------ Zone control ---------------------------------------------------
-
-int mcp_set_zone_state(int zone, int on) {                                                        // Set a zone ON (1) or OFF (0)
-    uint8_t reg, mask;                                                                            // Target register/bit
-    if (mcp_map_zone(zone, &reg, &mask)) {                                                        // Validate zone
-        fprintf(stderr, "Invalid zone: %d\n", zone);                                              // Log to stderr
-        syslog(LOG_ERR, "Invalid zone: %d", zone);                                                // Log to syslog
-        return -1;                                                                                // Fail
+int mcp_set_zone_state(int zone, int on) {
+    uint8_t reg, mask;
+    if (mcp_map_zone(zone, &reg, &mask) != 0) {                                 // First, translate the logical zone number into a physical register and bitmask.
+        fprintf(stderr, "Invalid zone: %d\n", zone);
+        syslog(LOG_ERR, "Attempted to set invalid zone: %d", zone);
+        return -1;
     }
 
-    if (g_mutex) pthread_mutex_lock(g_mutex);                                                     // Lock critical section if multithreaded
+    if (g_mutex) pthread_mutex_lock(g_mutex);                                   // If a mutex is configured (it should be), lock it to ensure this entire operation is atomic.
 
-    uint8_t val;                                                                                  // Current register value
-    if (mcp_read(reg, &val)) {                                                                    // Read register
-        if (g_mutex) pthread_mutex_unlock(g_mutex);                                               // Unlock if locked
-        syslog(LOG_ERR, "mcp_read failed (zone %d)", zone);                                       // Log to syslog
-        return -1;                                                                                // Fail
+    int rc = -1;                                                                // Initialize return code to failure; it will be updated on success.
+    uint8_t current_val;
+    // This is a "read-modify-write" operation, -essential- for changing one pin without affecting others.
+    if (mcp_read(reg, &current_val) == 0) {                                     // 1. READ the current state of all 8 pins on the port.
+        uint8_t new_val = on ? (current_val | mask) : (current_val & ~mask);    // 2. MODIFY only the bit for our target pin.
+                                                                                //    - `| mask` (OR) forces the target bit to 1 (ON).
+                                                                                //    - `& ~mask` (AND NOT) forces the target bit to 0 (OFF).
+        if (g_debug) {                                                          // Log the details of the change if debugging is enabled.
+            fprintf(stderr, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)\n",
+                    zone, on ? "ON" : "OFF", current_val, new_val, reg);
+            syslog(LOG_DEBUG, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)",
+                   zone, on ? "ON" : "OFF", current_val, new_val, reg);
+        }
+        
+        rc = mcp_write(reg, new_val);                                           // 3. WRITE the new 8-bit value back to the register.
+        if (rc != 0) {
+            syslog(LOG_ERR, "mcp_write failed during state set for zone %d", zone);
+        }
+    } else {
+        syslog(LOG_ERR, "mcp_read failed during state set for zone %d", zone);
     }
-    uint8_t newval = on ? (val | mask) : (val & ~mask);                                           // Apply change
-    if (g_debug) {                                                                                // Optional debug
-        fprintf(stderr, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)\n",                         // To stderr
-                zone, on ? "ON" : "OFF", val, newval, reg);
-        syslog(LOG_DEBUG, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)",                         // To syslog
-               zone, on ? "ON" : "OFF", val, newval, reg);
-    }
-    int rc = mcp_write(reg, newval);                                                              // Write back new value
-    if (rc != 0) syslog(LOG_ERR, "mcp_write failed (zone %d)", zone);                             // Log error
-
-    if (g_mutex) pthread_mutex_unlock(g_mutex);                                                   // Unlock critical section
-    return rc;                                                                                    // Return result
+    if (g_mutex) pthread_mutex_unlock(g_mutex);                                 // Always unlock the mutex when done, even if an error occurred.
+    return rc;                                                                  // Return the final status of the operation.
 }
 
-// ------------------------------ Thread-safety setup --------------------------------------------
-
-void mcp_enable_thread_safety(pthread_mutex_t *external_mutex) {                                  // Enable thread safety
-    g_mutex = external_mutex;                                                                     // Store pointer to external mutex
+void mcp_enable_thread_safety(pthread_mutex_t *external_mutex) {                // This allows the main application to pass its own mutex to this driver.
+    g_mutex = external_mutex;                                                   // Store the pointer to the mutex for use in `mcp_set_zone_state`.
 }
