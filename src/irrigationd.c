@@ -60,34 +60,63 @@
 #define MAX_ZONE        14                                                      // Maximum number of irrigation zones
 #define SERVER_PORT     4242                                                    // TCP port for listening to commands
 #define BACKLOG         5                                                       // Connection queue size for listen()
+#define CMD_BUF_SZ      256                                                     // Command buffer size (larger than before)
 
 /* --- Global State --- */
 static int zone_state[MAX_ZONE + 1];                                            // Software mirror of zone states (0=OFF, 1=ON)
+                                                                                //                                                                               
+/* ADDITIONAL DOC: The zone_state[] array is protected by the MCP driver's mutex  */
+/* The driver exposes mcp_lock/mcp_unlock (no-op if no mutex)   */
+/* callers must use mcp_lock/mcp_unlock when performing a      */
+/* composite operation that touches hardware AND zone_state[]  */
+
 static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;                   // Mutex to protect access to zone_state and hardware
+                                                                                //                                                                               
+/* ADDITIONAL DOC: The zone_lock is intended to be shared with the driver using  */
+/* mcp_enable_thread_safety(&zone_lock). The preferred usage  */
+/* pattern is to call mcp_lock()/mcp_unlock() around driver   */
+/* operations that must be atomic with updates to zone_state.  */
+
+/* Prototypes for mcp_lock()/mcp_unlock() are now in mcp23017.h, no need here. */
 
 /**
  * @brief Sets the state of a specific irrigation zone.
  * @description This function updates both the software state array and the
  * physical hardware state via the MCP23017 driver. It is
- * thread-safe, using a mutex to protect the shared zone_state array.
+ * thread-safe when the driver mutex is enabled via mcp_enable_thread_safety.
+ * The function takes the following approach:
+ *   1) Acquire driver lock via mcp_lock()                              <-- atomic region start
+ *   2) Update hardware via mcp_set_zone_state() (caller holds lock)    <-- hardware update
+ *   3) Update software mirror zone_state[] while still holding lock    <-- keep hw + sw consistent
+ *   4) Release driver lock via mcp_unlock()                            <-- atomic region end
  * @param zone The zone number (1-based index).
  * @param state The desired state: 1 for ON, 0 for OFF.
- * @note This function assumes that the underlying `mcp_set_zone_state` function
- * is also thread-safe, which is configured in `main()` by passing it a
- * pointer to the `zone_lock` mutex.
+ * @note The function also validates the zone index before indexing zone_state[].
  */
 static void set_zone_state(int zone, int state)
 {
-    pthread_mutex_lock(&zone_lock);                                             // Lock the mutex to protect shared state
-    zone_state[zone] = state;
-    pthread_mutex_unlock(&zone_lock);
+    if (zone < 1 || zone > MAX_ZONE) {
+        fprintf(stderr, "ERROR: set_zone_state(): invalid zone %d\n", zone);
+        return;
+    }
 
-    // Update the physical hardware state. This call is made outside the lock
-    // on this side, as the MCP driver is responsible for its own locking.
+    /* Acquire driver-provided lock to make the following sequence atomic:
+     *    hardware update + software mirror update
+     */
+    mcp_lock();
+
     if (mcp_set_zone_state(zone, state) != 0) {
         fprintf(stderr, "ERROR: Failed to set zone %d -> %s\n", zone, state ? "ON" : "OFF");
+        /* Note: we still update the software mirror only if the hardware call succeeded.
+         * If you prefer to always reflect desired state in software regardless of HW error,
+         * move the assignment outside this if block.
+         */
+    } else {
+        zone_state[zone] = state;
+        printf("Zone %d -> %s\n", zone, state ? "ON" : "OFF");
     }
-    printf("Zone %d -> %s\n", zone, state ? "ON" : "OFF");
+
+    mcp_unlock();
 }
 
 /**
@@ -159,6 +188,40 @@ static int parse_command(int cfd, const char *line)
 }
 
 /**
+ * @brief Helper: read a line (terminated by newline) from socket into buffer.
+ * @description Reads from `fd` until a newline is found or buffer is full. Handles
+ * EINTR and short reads correctly.
+ * @param fd socket file descriptor to read from.
+ * @param buf buffer to fill; will always be null-terminated on success.
+ * @param sz size of buf (must be >= 2).
+ * @return number of bytes placed into buf (excluding terminating NUL), or -1 on error.
+ */
+static ssize_t read_line(int fd, char *buf, size_t sz)
+{
+    if (sz < 2) return -1;
+    size_t used = 0;
+    while (used < sz - 1) {
+        ssize_t n = read(fd, buf + used, 1);
+        if (n == 0) {                     // EOF
+            break;
+        } else if (n < 0) {
+            if (errno == EINTR) continue; // try again
+            return -1;                    // other error
+        } else {
+            if (buf[used] == '\r') {      // skip CR
+                continue;
+            }
+            used++;
+            if (buf[used - 1] == '\n') {  // newline terminator found
+                break;
+            }
+        }
+    }
+    buf[used] = '\0';
+    return (ssize_t)used;
+}
+
+/**
  * @brief Pthread entry point to handle a single client connection.
  * @description Reads a command from the client socket, passes it to the command
  * parser, and then closes the connection.
@@ -171,14 +234,21 @@ static void *client_thread(void *arg)
     int cfd = *(int *)arg;
     free(arg);
 
-    char buf[128];
-    ssize_t n = read(cfd, buf, sizeof(buf) - 1);
+    char buf[CMD_BUF_SZ];
+    ssize_t n = read_line(cfd, buf, sizeof(buf));
     if (n > 0) {
-        buf[n] = '\0';                                                          // Null-terminate the received data
+        // strip trailing newline for robust parsing
+        if (n > 0 && buf[n - 1] == '\n') buf[n - 1] = '\0';
+        if (n > 1 && buf[n - 2] == '\r') buf[n - 2] = '\0';
+
         if (parse_command(cfd, buf) < 0) {                                      // If command parsing fails, send a helpful error message
             const char err[] = "ERR syntax (use: ZONE=<1..14> TIME=<seconds>)\n";
             (void)write(cfd, err, sizeof(err) - 1);
         }
+    } else if (n == 0) {
+        // no data from client; ignore quietly
+    } else {
+        perror("read");
     }
     close(cfd);                                                                 // Ensure the client connection is always closed
     return NULL;
@@ -215,7 +285,11 @@ int main(void)
 
     // Allow immediate reuse of the port after the daemon is restarted
     int opt = 1;
-    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt");
+        close(sfd);
+        exit(EXIT_FAILURE);
+    }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));

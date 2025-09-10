@@ -47,6 +47,12 @@ int     mcp_set_zone_state(int zone, int on);                                   
 // Optional: initialize mutex protection for multithreaded daemons                                //
 void    mcp_enable_thread_safety(pthread_mutex_t *external_mutex);                                // Pass a pointer to daemon’s mutex
 
+// Explicit lock/unlock helpers for atomic operations                                             //
+void    mcp_lock(void);                                                                           // Locks the shared mutex if enabled (no-op otherwise)
+void    mcp_unlock(void);                                                                         // Unlocks the shared mutex if enabled (no-op otherwise)
+// Callers should wrap composite sequences (e.g., hw + sw updates) in mcp_lock/mcp_unlock
+// This ensures hardware and zone_state[] mirror remain consistent without deadlocks
+
 #ifdef __cplusplus
 }
 #endif

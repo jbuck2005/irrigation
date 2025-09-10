@@ -33,6 +33,12 @@ static int g_fd = -1;                                                           
 static pthread_mutex_t *g_mutex = NULL;                                         // Pointer to an external mutex, enabling optional thread safety.
 static uint8_t g_debug = 0;                                                     // A flag to enable or disable verbose debug logging.
 
+/* ADDITIONAL DOC: The driver exposes mcp_lock()/mcp_unlock() as public    */
+/* helpers that lock/unlock the configured mutex. Callers */
+/* should wrap composite hardware+software sequences with  */
+/* mcp_lock(); mcp_unlock(); to guarantee atomic */
+/* behavior without risk of double-lock deadlocks.        */
+
 int mcp_i2c_open(const char *devnode) {
     g_fd = open(devnode, O_RDWR);                                               // Open the specified I2C device file (e.g., "/dev/i2c-1") for reading and writing.
     if (g_fd < 0) {                                                             // System calls return -1 on error, so we must always check the result.
@@ -59,7 +65,31 @@ void mcp_i2c_close(void) {
     g_fd = -1;                                                                  // Invalidate the global descriptor to prevent accidental reuse.
 }
 
+/**
+ * @brief Lock the driver's mutex if configured.
+ * @description When the application calls mcp_enable_thread_safety() with an
+ * external mutex, this function locks that mutex. If no mutex was configured,
+ * this function is a no-op.
+ */
+void mcp_lock(void) {
+    if (g_mutex) pthread_mutex_lock(g_mutex);
+}
+
+/**
+ * @brief Unlock the driver's mutex if configured.
+ * @description Complement to mcp_lock(). If no mutex was configured, this is a
+ * no-op.
+ */
+void mcp_unlock(void) {
+    if (g_mutex) pthread_mutex_unlock(g_mutex);
+}
+
 static int mcp_write(uint8_t reg, uint8_t val) {
+    if (g_fd < 0) {
+        syslog(LOG_ERR, "mcp_write called with invalid file descriptor");
+        return -1;
+    }
+
     uint8_t buf[2] = { reg, val };                                              // An I2C write requires sending the register address followed by the data.
     if (write(g_fd, buf, 2) != 2) {                                             // Attempt to write the 2-byte buffer to the device.
         perror("mcp_write");                                                    // `write` should return the number of bytes written; if it's not 2, an error occurred.
@@ -70,8 +100,14 @@ static int mcp_write(uint8_t reg, uint8_t val) {
 }
 
 static int mcp_read(uint8_t reg, uint8_t *out) {
+    if (g_fd < 0) {
+        syslog(LOG_ERR, "mcp_read called with invalid file descriptor");
+        return -1;
+    }
+
     // An I2C read is a two-step process: first write the register address you want to read...
-    if (write(g_fd, &reg, 1) != 1) {
+    uint8_t r = reg;
+    if (write(g_fd, &r, 1) != 1) {
         perror("mcp_read (set addr)");
         syslog(LOG_ERR, "I2C failed to set read address to 0x%02x: %s", reg, strerror(errno));
         return -1;
@@ -117,6 +153,21 @@ int mcp_map_zone(int zone, uint8_t *reg, uint8_t *mask) {
     }
 }
 
+/**
+ * @brief Set the state of a zone (ON/OFF).
+ * @description This function performs the standard read-modify-write operation
+ * on the port register.  IMPORTANT: this function **does not** acquire or
+ * release the external mutex. Callers should call mcp_lock() and mcp_unlock()
+ * if they need atomicity across multiple driver calls or when synchronizing
+ * with external state mirrored in the application.
+ *
+ * Rationale: making this function assume the mutex is already held avoids the
+ * possibility of deadlock when the caller already holds the same mutex.
+ *
+ * @param zone zone number (1-14)
+ * @param on   1 to set ON, 0 to set OFF
+ * @return 0 on success, -1 on error
+ */
 int mcp_set_zone_state(int zone, int on) {
     uint8_t reg, mask;
     if (mcp_map_zone(zone, &reg, &mask) != 0) {                                 // First, translate the logical zone number into a physical register and bitmask.
@@ -124,8 +175,6 @@ int mcp_set_zone_state(int zone, int on) {
         syslog(LOG_ERR, "Attempted to set invalid zone: %d", zone);
         return -1;
     }
-
-    if (g_mutex) pthread_mutex_lock(g_mutex);                                   // If a mutex is configured (it should be), lock it to ensure this entire operation is atomic.
 
     int rc = -1;                                                                // Initialize return code to failure; it will be updated on success.
     uint8_t current_val;
@@ -140,7 +189,7 @@ int mcp_set_zone_state(int zone, int on) {
             syslog(LOG_DEBUG, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)",
                    zone, on ? "ON" : "OFF", current_val, new_val, reg);
         }
-        
+
         rc = mcp_write(reg, new_val);                                           // 3. WRITE the new 8-bit value back to the register.
         if (rc != 0) {
             syslog(LOG_ERR, "mcp_write failed during state set for zone %d", zone);
@@ -148,10 +197,18 @@ int mcp_set_zone_state(int zone, int on) {
     } else {
         syslog(LOG_ERR, "mcp_read failed during state set for zone %d", zone);
     }
-    if (g_mutex) pthread_mutex_unlock(g_mutex);                                 // Always unlock the mutex when done, even if an error occurred.
     return rc;                                                                  // Return the final status of the operation.
 }
 
+/**
+ * @brief Configure the driver to use an external mutex for thread safety.
+ * @description The application may call this with a pointer to a pthread_mutex_t
+ * which the driver will use for multi-threaded protection.  After calling this,
+ * mcp_lock() and mcp_unlock() will lock/unlock that mutex.  Note: the
+ * application should prefer to use mcp_lock/mcp_unlock to perform composite
+ * operations that span driver and application state.  mcp_set_zone_state()
+ * assumes the caller may already hold the mutex and therefore does not lock.
+ */
 void mcp_enable_thread_safety(pthread_mutex_t *external_mutex) {                // This allows the main application to pass its own mutex to this driver.
     g_mutex = external_mutex;                                                   // Store the pointer to the mutex for use in `mcp_set_zone_state`.
 }
