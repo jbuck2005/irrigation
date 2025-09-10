@@ -1,0 +1,15 @@
+# Object files
+*.o
+
+# Binaries
+irrigation
+irrigationctl
+irrigationd
+
+# Backup files
+*~
+*.bak
+
+# Editor configs
+.vscode/
+*.swp

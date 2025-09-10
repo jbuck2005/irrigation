@@ -1,0 +1,31 @@
+# irrigationd.service                                                                             // systemd unit for irrigation daemon
+#
+# This service runs irrigationd, which listens on a TCP port (default 4242)                        //
+# and drives the MCP23017-based irrigation controller.                                             //
+#
+# Usage:                                                                                          //
+#   sudo systemctl enable irrigationd.service     # Start on boot                                  //
+#   sudo systemctl start  irrigationd.service     # Start immediately                              //
+#   sudo systemctl status irrigationd.service     # Check status                                   //
+
+[Unit]
+Description=Irrigation Control Daemon (MCP23017 + TCP server)                                     
+After=network.target                                                                              
+
+[Service]
+Type=simple                                                                                      
+ExecStart=/usr/local/bin/irrigationd                                                              
+Restart=always                                                                                   
+RestartSec=5                                                                                      
+User=james                                                                                           
+Group=james                                                                                          
+
+# Environment variables control TCP port and debug logging                                         
+Environment="IRRIGATION_PORT=4242"                                                                
+Environment="IRRIGATION_DEBUG=0"                                                                  
+
+# Working directory (optional, but makes logs cleaner)                                             
+WorkingDirectory=/usr/local/bin                                                                   
+
+[Install]
+WantedBy=multi-user.target                                                                        
