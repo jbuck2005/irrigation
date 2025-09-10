@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"makefile.launchConfigurations": [
+			{
+				"cwd": "c:\\Users\\James\\Documents\\GitHub\\irrigation\\build",
+				"binaryPath": "c:\\Users\\James\\Documents\\GitHub\\irrigation\\build\\main",
+				"binaryArgs": []
+			}
+		]
+	}
+}
