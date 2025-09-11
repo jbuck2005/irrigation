@@ -1,86 +1,64 @@
-#include <stdio.h>                                                                 // Standard I/O (fprintf, etc.)
-#include <stdlib.h>                                                                // Memory management, exit codes
-#include <string.h>                                                                // String handling (strstr, strcmp)
-#include <unistd.h>                                                                // POSIX API (read, write, close)
-#include <errno.h>                                                                 // errno variable and strerror()
-#include <pthread.h>                                                               // POSIX threads for concurrency
-#include <sys/socket.h>                                                            // Sockets API
-#include <netinet/in.h>                                                            // sockaddr_in, htons, INADDR_ANY
-#include <arpa/inet.h>                                                             // inet_ntop, inet_addr, inet_pton
-#include <semaphore.h>                                                             // POSIX semaphores
-#include <sys/types.h>                                                             // Basic system data types
-#include <time.h>                                                                  // Sleep handling
-#include <sys/time.h>                                                              // struct timeval for timeouts
-#include <stdarg.h>                                                                // Variadic functions
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <semaphore.h>
+#include <sys/types.h>
+#include <time.h>
+#include <fcntl.h>
 
-#include "mcp23017.h"                                                              // MCP23017 driver interface
+#include "mcp23017.h"
+#include "rate_limit.h"
+#include "auth.h"
 
 // -----------------------------------------------------------------------------
-// irrigationd.c - Irrigation controller daemon
+// irrigationd.c - Irrigation controller daemon (modularized)
+// -----------------------------------------------------------------------------
 //
-// This daemon listens for simple text-based commands over TCP and manages
-// irrigation zones connected through an MCP23017 GPIO expander.
-//
-// Example command format (single line, terminated by newline):
-//   ZONE=1 TIME=30 TOKEN=changeme
-//
-// Commands:
-//   ZONE=n TIME=s [TOKEN=secret]                                                   // Turn zone n ON for s seconds
-//   ZONE=n TIME=0 [TOKEN=secret]                                                   // Turn zone n OFF immediately
-//
-// Token authentication is mandatory: if IRRIGATIOND_TOKEN is not set in the
-// environment (via /etc/default/irrigationd), the daemon refuses to start.       // Prevents insecure deployments
+// Responsibilities:
+//   - Accept TCP connections
+//   - Enforce per-IP rate limiting (rate_limit.[ch])
+//   - Authenticate commands (auth.[ch])
+//   - Parse irrigation commands and manage worker threads
+//   - Control MCP23017 GPIO expander
 //
 // -----------------------------------------------------------------------------
 
-#define SERVER_PORT     4242                                                       // TCP port to listen on
-#define CMD_BUF_SZ      256                                                        // Max command length in bytes
-#define MAX_WORKERS     32                                                         // Max concurrent worker threads
+#define SERVER_PORT     4242
+#define CMD_BUF_SZ      256
+#define MAX_WORKERS     32
+#define ADDRBUF_SZ      64
+#define TOKEN_MAX_SZ    128
+#define WHO_SZ          64
 
-// -----------------------------------------------------------------------------
-// Shared state
-// -----------------------------------------------------------------------------
-static int zone_state[MAX_ZONE+1];          // zone_state[z] = 1 if ON, 0 if OFF
+static int zone_state[MAX_ZONE+1];
 static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
 static sem_t worker_slots;
 static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t *worker_list = NULL;
 static size_t worker_count = 0;
 static size_t worker_capacity = 0;
-static const char *g_auth_token = NULL;
+static char *g_auth_token = NULL;
 
 // -----------------------------------------------------------------------------
-// Memory-safe allocation wrappers with centralized error handling
+// Worker tracking helpers
 // -----------------------------------------------------------------------------
-
 static void *xmalloc(size_t sz) {
     void *p = malloc(sz);
-    if (!p) {
-        fprintf(stderr, "malloc(%zu) failed: %s\n", sz, strerror(errno));
-        exit(EXIT_FAILURE);
-    }
+    if (!p) { fprintf(stderr, "malloc failed\n"); exit(1); }
     return p;
 }
-
-static void *xrealloc(void *old, size_t sz) {
-    void *p = realloc(old, sz);
-    if (!p) {
-        fprintf(stderr, "realloc(%zu) failed: %s\n", sz, strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-    return p;
-}
-
-// -----------------------------------------------------------------------------
-// Worker tracking (ensures we can join all threads on shutdown)
-// -----------------------------------------------------------------------------
 
 static void add_worker(pthread_t tid) {
     pthread_mutex_lock(&workers_lock);
     if (worker_count == worker_capacity) {
         size_t newcap = worker_capacity ? worker_capacity * 2 : 8;
-        pthread_t *newlist = xrealloc(worker_list, newcap * sizeof(pthread_t));
-        worker_list = newlist;
+        worker_list = realloc(worker_list, newcap * sizeof(pthread_t));
         worker_capacity = newcap;
     }
     worker_list[worker_count++] = tid;
@@ -98,30 +76,11 @@ static void remove_worker(pthread_t tid) {
     pthread_mutex_unlock(&workers_lock);
 }
 
-static void join_workers_and_cleanup(void) {
-    pthread_mutex_lock(&workers_lock);
-    for (size_t i = 0; i < worker_count; i++) {
-        int jrc = pthread_join(worker_list[i], NULL);
-        if (jrc != 0) {
-            fprintf(stderr, "pthread_join failed on worker %zu: %s\n", i, strerror(jrc));
-        }
-    }
-    free(worker_list);
-    worker_list = NULL;
-    worker_count = worker_capacity = 0;
-    pthread_mutex_unlock(&workers_lock);
-}
-
 // -----------------------------------------------------------------------------
 // Zone control
 // -----------------------------------------------------------------------------
-
 static void set_zone_state(const char *who, int zone, int state) {
-    if (zone < 1 || zone > MAX_ZONE) {
-        fprintf(stderr, "set_zone_state: invalid zone %d (by %s)\n", zone, who ? who : "unknown");
-        return;
-    }
-
+    if (zone < 1 || zone > MAX_ZONE) return;
     pthread_mutex_lock(&zone_lock);
     zone_state[zone] = state;
     pthread_mutex_unlock(&zone_lock);
@@ -130,274 +89,159 @@ static void set_zone_state(const char *who, int zone, int state) {
     mcp_set_zone_state(zone, state);
     mcp_unlock();
 
-    fprintf(stderr, "[%s] Zone %d -> %s\n", who ? who : "unknown", zone, state ? "ON" : "OFF");
+    fprintf(stderr, "[%s] Zone %d -> %s\n", who ? who : "?", zone, state ? "ON" : "OFF");
 }
 
 // -----------------------------------------------------------------------------
-// Worker thread: executes timed zone control
+// Worker thread
 // -----------------------------------------------------------------------------
-
-struct worker_arg {
-    int zone;
-    int duration;
-    char who[64];
-};
+struct worker_arg { int zone, duration; char who[WHO_SZ]; };
 
 static void *worker_thread(void *arg) {
     struct worker_arg *wa = arg;
-
-    if (!wa) {
-        fprintf(stderr, "worker_thread: null arg\n");
-        return NULL;
-    }
-
-    if (sem_wait(&worker_slots) != 0) {
-        fprintf(stderr, "worker_thread: failed to acquire slot semaphore\n");
-        free(wa);
-        return NULL;
-    }
-
     set_zone_state(wa->who, wa->zone, 1);
     if (wa->duration > 0) {
-        sleep(wa->duration);                                                       // Blocks this thread only
+        sleep(wa->duration);
         set_zone_state(wa->who, wa->zone, 0);
     }
-
     free(wa);
-    sem_post(&worker_slots);                                                       // Release slot
-    remove_worker(pthread_self());                                                 // Remove from tracking
-    return NULL;
-}
-
-// -----------------------------------------------------------------------------
-// Command parser
-// -----------------------------------------------------------------------------
-
-static char *get_kv(const char *cmd, const char *key) {
-    size_t klen = strlen(key);
-    const char *p = strstr(cmd, key);
-    if (p && p[klen] == '=') {
-        return (char *)(p + klen + 1);
-    }
-    return NULL;
-}
-
-static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
-    char *zone_s = get_kv(cmd, "ZONE");
-    char *time_s = get_kv(cmd, "TIME");
-    char *token  = get_kv(cmd, "TOKEN");
-
-    if (!zone_s || !time_s) {
-        const char err[] = "ERR missing ZONE or TIME\n";
-        write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME): '%s'\n", addrbuf, cmd);
-        return -1;
-    }
-
-    if (!token || strcmp(token, g_auth_token) != 0) {
-        const char err[] = "ERR auth required\n";
-        write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (bad/missing token): '%s'\n", addrbuf, cmd);
-        return -1;
-    }
-
-    int zone = atoi(zone_s);
-    int duration = atoi(time_s);
-
-    if (zone < 1 || zone > MAX_ZONE || duration < 0 || duration > 86400) {
-        const char err[] = "ERR invalid ZONE or TIME\n";
-        write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (invalid zone/time): '%s'\n", addrbuf, cmd);
-        return -1;
-    }
-
-    // Special case: TIME=0 → turn OFF immediately, no worker
-    if (duration == 0) {
-        set_zone_state(addrbuf, zone, 0);
-        const char ok[] = "OK\n";
-        write(cfd, ok, sizeof(ok) - 1);
-        fprintf(stderr, "[%s] Zone %d OFF (immediate stop)\n", addrbuf, zone);
-        return 0;
-    }
-
-    // Normal timed run
-    struct worker_arg *wa = xmalloc(sizeof(struct worker_arg));
-    wa->zone = zone;
-    wa->duration = duration;
-    snprintf(wa->who, sizeof(wa->who), "%s", addrbuf);
-
-    pthread_t tid;
-    int rc = pthread_create(&tid, NULL, worker_thread, wa);
-    if (rc != 0) {
-        fprintf(stderr, "pthread_create failed: %s\n", strerror(rc));
-        free(wa);
-        const char err[] = "ERR cannot create worker\n";
-        write(cfd, err, sizeof(err) - 1);
-        return -1;
-    }
-    add_worker(tid);
-
-    const char ok[] = "OK\n";
-    write(cfd, ok, sizeof(ok) - 1);
-    fprintf(stderr, "[%s] Accepted command: '%s'\n", addrbuf, cmd);
-    return 0;
-}
-
-// -----------------------------------------------------------------------------
-// Client thread handler (per connection)
-// -----------------------------------------------------------------------------
-
-static void format_client_addr(const struct sockaddr_in *cli, char *buf, size_t sz) {
-    char ip[INET_ADDRSTRLEN];
-    if (!inet_ntop(AF_INET, &cli->sin_addr, ip, sizeof(ip))) {
-        snprintf(buf, sz, "unknown");
-    } else {
-        snprintf(buf, sz, "%s:%d", ip, ntohs(cli->sin_port));
-    }
-}
-
-static ssize_t read_line(int fd, char *buf, size_t sz) {
-    size_t i = 0;
-    while (i < sz - 1) {
-        char c;
-        ssize_t rc = read(fd, &c, 1);
-        if (rc == 1) {
-            if (c == '\n') break;
-            buf[i++] = c;
-        } else if (rc == 0) {
-            break;
-        } else {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-    }
-    buf[i] = '\0';
-    return (ssize_t)i;
-}
-
-struct client_arg {
-    int cfd;
-    struct sockaddr_in cli;
-};
-
-static void *client_thread(void *arg) {
-    struct client_arg *carg = arg;
-    int cfd = carg->cfd;
-    struct sockaddr_in cli = carg->cli;
-    free(carg);
-
-    char addrbuf[64];
-    format_client_addr(&cli, addrbuf, sizeof(addrbuf));
-
-    struct timeval tv;
-    tv.tv_sec = 10;
-    tv.tv_usec = 0;
-    (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    char buf[CMD_BUF_SZ];
-    ssize_t n = read_line(cfd, buf, sizeof(buf));
-    if (n > 0) {
-        parse_command(cfd, buf, addrbuf);
-    } else if (n < 0) {
-        fprintf(stderr, "[%s] read from client failed: %s\n", addrbuf, strerror(errno));
-    }
-
-    close(cfd);
     sem_post(&worker_slots);
     remove_worker(pthread_self());
     return NULL;
 }
 
 // -----------------------------------------------------------------------------
-// Main server loop
+// Command parsing
 // -----------------------------------------------------------------------------
+static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
+    char zone_s[32]={0}, time_s[32]={0}, token_s[TOKEN_MAX_SZ]={0};
+    int have_zone=0, have_time=0, have_token=0;
 
-int main(void) {
-    g_auth_token = getenv("IRRIGATIOND_TOKEN");
-    const char *bind_env = getenv("IRRIGATIOND_BIND_ADDR");
-    struct in_addr bind_addr = {0};
-    int have_bind_addr = 0;
-    if (bind_env && bind_env[0] != '\0') {
-        if (inet_pton(AF_INET, bind_env, &bind_addr) == 1) {
-            have_bind_addr = 1;
-        } else {
-            fprintf(stderr, "Invalid IRRIGATIOND_BIND_ADDR '%s', falling back to 127.0.0.1\n", bind_env);
+    char buf[CMD_BUF_SZ];
+    strncpy(buf, cmd, sizeof(buf)-1);
+
+    char *saveptr=NULL, *tok=strtok_r(buf, " \t\r\n", &saveptr);
+    while (tok) {
+        char *eq=strchr(tok,'=');
+        if (eq) {
+            *eq='\0';
+            char *key=tok, *val=eq+1;
+            if (!strcmp(key,"ZONE")) { strncpy(zone_s,val,sizeof(zone_s)-1); have_zone=1; }
+            else if (!strcmp(key,"TIME")) { strncpy(time_s,val,sizeof(time_s)-1); have_time=1; }
+            else if (!strcmp(key,"TOKEN")) { strncpy(token_s,val,sizeof(token_s)-1); have_token=1; }
         }
+        tok=strtok_r(NULL," \t\r\n",&saveptr);
     }
 
-    if (g_auth_token) {
-        fprintf(stderr, "Token enforcement enabled (IRRIGATIOND_TOKEN is set)\n");
-    } else {
-        fprintf(stderr, "IRRIGATIOND_TOKEN is not set, refusing to start insecure\n");
-        exit(EXIT_FAILURE);
+    if (!have_zone||!have_time||!have_token) {
+        write(cfd,"ERR missing fields\n",19); return -1;
+    }
+    if (!safe_str_equals(token_s,g_auth_token)) {
+        char redacted[128]; sanitize_cmd_for_log(cmd,redacted,sizeof(redacted));
+        fprintf(stderr,"[%s] rejected (bad token): %s\n",addrbuf,redacted);
+        write(cfd,"ERR auth required\n",18); return -1;
     }
 
-    if (mcp_i2c_open("/dev/i2c-1") < 0) {
-        fprintf(stderr, "ERROR: Failed to open I2C bus\n");
-        exit(EXIT_FAILURE);
+    char *end=NULL;
+    long z=strtol(zone_s,&end,10);
+    long t=strtol(time_s,&end,10);
+    if (z<1||z>MAX_ZONE||t<0||t>86400) {
+        write(cfd,"ERR invalid\n",12); return -1;
     }
 
-    sem_init(&worker_slots, 0, MAX_WORKERS);
-
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        fprintf(stderr, "socket failed: %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
+    if (t==0) {
+        set_zone_state(addrbuf,(int)z,0);
+        write(cfd,"OK\n",3); return 0;
     }
 
-    int yes = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(SERVER_PORT);
-    if (have_bind_addr) {
-        addr.sin_addr = bind_addr;
-        char bstr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr.sin_addr, bstr, sizeof(bstr));
-        fprintf(stderr, "Binding to %s:%d\n", bstr, SERVER_PORT);
-    } else {
-        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-        fprintf(stderr, "Binding to 127.0.0.1:%d\n", SERVER_PORT);
+    if (sem_trywait(&worker_slots)!=0) {
+        write(cfd,"ERR busy\n",9); return -1;
     }
 
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "bind failed: %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
-    }
+    struct worker_arg *wa=xmalloc(sizeof(*wa));
+    wa->zone=(int)z; wa->duration=(int)t;
+    snprintf(wa->who,sizeof(wa->who),"%s",addrbuf);
 
-    if (listen(listen_fd, 8) < 0) {
-        fprintf(stderr, "listen failed: %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
+    pthread_t tid;
+    if (pthread_create(&tid,NULL,worker_thread,wa)!=0) {
+        free(wa); sem_post(&worker_slots); write(cfd,"ERR thread\n",11); return -1;
     }
+    add_worker(tid);
+    write(cfd,"OK\n",3);
+    return 0;
+}
 
-    fprintf(stderr, "irrigationd listening on port %d\n", SERVER_PORT);
+// -----------------------------------------------------------------------------
+// Client thread
+// -----------------------------------------------------------------------------
+struct client_arg { int cfd; struct sockaddr_in cli; };
+
+static void *client_thread(void *arg) {
+    struct client_arg *carg=arg;
+    int cfd=carg->cfd; struct sockaddr_in cli=carg->cli;
+    free(carg);
+
+    char addrbuf[ADDRBUF_SZ];
+    inet_ntop(AF_INET,&cli.sin_addr,addrbuf,sizeof(addrbuf));
+
+    char buf[CMD_BUF_SZ];
+    ssize_t n=read(cfd,buf,sizeof(buf)-1);
+    if (n>0) { buf[n]='\0'; parse_command(cfd,buf,addrbuf); }
+    close(cfd);
+    remove_worker(pthread_self());
+    return NULL;
+}
+
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
+int main(void) {
+    const char *env_token=getenv("IRRIGATIOND_TOKEN");
+    if (!env_token||!*env_token) {
+        fprintf(stderr,"IRRIGATIOND_TOKEN not set\n"); exit(1);
+    }
+    g_auth_token=strdup(env_token);
+
+    if (mcp_i2c_open("/dev/i2c-1")<0) exit(1);
+    sem_init(&worker_slots,0,MAX_WORKERS);
+    rl_init();
+
+    int listen_fd=socket(AF_INET,SOCK_STREAM,0);
+    int yes=1; setsockopt(listen_fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
+
+    struct sockaddr_in addr={0};
+    addr.sin_family=AF_INET; addr.sin_port=htons(SERVER_PORT);
+    inet_pton(AF_INET,"127.0.0.1",&addr.sin_addr);
+
+    bind(listen_fd,(struct sockaddr*)&addr,sizeof(addr));
+    listen(listen_fd,128);
+
+    fprintf(stderr,"irrigationd listening on port %d\n",SERVER_PORT);
 
     while (1) {
-        struct sockaddr_in cli;
-        socklen_t clen = sizeof(cli);
-        int cfd = accept(listen_fd, (struct sockaddr *)&cli, &clen);
-        if (cfd < 0) {
-            if (errno == EINTR) continue;
-            fprintf(stderr, "accept failed: %s\n", strerror(errno));
-            continue;
+        struct sockaddr_in cli; socklen_t clen=sizeof(cli);
+        int cfd=accept(listen_fd,(struct sockaddr*)&cli,&clen);
+        if (cfd<0) continue;
+
+        uint32_t ip=ntohl(cli.sin_addr.s_addr);
+        if (!rl_check_and_consume(ip)) {
+            write(cfd,"ERR rate limit\n",15);
+            close(cfd); continue;
         }
 
-        struct client_arg *carg = xmalloc(sizeof(struct client_arg));
-        carg->cfd = cfd;
-        carg->cli = cli;
+        struct client_arg *carg=xmalloc(sizeof(*carg));
+        carg->cfd=cfd; carg->cli=cli;
 
         pthread_t tid;
-        if (pthread_create(&tid, NULL, client_thread, carg) != 0) {
-            fprintf(stderr, "pthread_create failed: %s\n", strerror(errno));
-            close(cfd);
-            free(carg);
-            continue;
+        if (pthread_create(&tid,NULL,client_thread,carg)!=0) {
+            close(cfd); free(carg); continue;
         }
         add_worker(tid);
     }
 
     close(listen_fd);
-    join_workers_and_cleanup();
+    rl_cleanup();
+    mcp_i2c_close();
+    free(g_auth_token);
     return 0;
 }

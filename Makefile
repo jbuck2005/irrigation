@@ -1,59 +1,127 @@
-# Compiler and flags
+# -------------------------------------------------------------------
+# Makefile for irrigationd project
+# -------------------------------------------------------------------
+# Targets:
+#   make            -> build irrigationd daemon
+#   make tests      -> build unit tests
+#   make install    -> install daemon, service, defaults file, create user
+#   make uninstall  -> remove installed files
+#   make clean      -> remove all binaries/objects
+#
+# Flags:
+#   DEBUG=1         -> enable debug symbols and disable optimizations
+# -------------------------------------------------------------------
+
 CC      := gcc
-CFLAGS  := -Wall -Wextra -O2 -Iinclude
-LDFLAGS := -pthread
+CFLAGS  := -Wall -Wextra -std=c11 -Iinclude
+LDFLAGS := -lpthread
 
 SRC_DIR := src
-OBJ_DIR := build
-BIN_DIR := bin
-SYSTEMD_DIR := systemd
-EXAMPLES_DIR := examples
-
-# Programs
-PROGRAMS := irrigationctl irrigationd
+INC_DIR := include
 
 # Source files
-IRRIGATIONCTL_SRCS:= $(SRC_DIR)/irrigationctl.c
-IRRIGATIOND_SRCS  := $(SRC_DIR)/irrigationd.c $(SRC_DIR)/mcp23017.c
+DAEMON_SRCS := $(SRC_DIR)/irrigationd.c \
+               $(SRC_DIR)/mcp23017.c \
+               $(SRC_DIR)/rate_limit.c \
+               $(SRC_DIR)/auth.c
+DAEMON_OBJS := $(DAEMON_SRCS:.c=.o)
 
-# Object files
-IRRIGATIONCTL_OBJS:= $(IRRIGATIONCTL_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
-IRRIGATIOND_OBJS  := $(IRRIGATIOND_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+TEST_AUTH_SRCS := test_auth.c $(SRC_DIR)/auth.c
+TEST_AUTH_OBJS := $(TEST_AUTH_SRCS:.c=.o)
 
+TEST_RL_SRCS   := test_rate_limit.c $(SRC_DIR)/rate_limit.c
+TEST_RL_OBJS   := $(TEST_RL_SRCS:.c=.o)
+
+# Binaries
+DAEMON_BIN := irrigationd
+TEST_BINS  := test_auth test_rate_limit
+
+# Debug mode
+ifeq ($(DEBUG),1)
+  CFLAGS += -g -O0
+else
+  CFLAGS += -O2
+endif
+
+# Installation paths
+PREFIX      ?= /usr/local
+BINDIR      := $(PREFIX)/bin
+SYSTEMD_DIR ?= /etc/systemd/system
+DEFAULTS_DIR?= /etc/default
+
+SERVICE_FILE := systemd/irrigationd.service
+DEFAULTS_FILE := examples/irrigationd.defaults
+
+# -------------------------------------------------------------------
 # Default target
-all: $(BIN_DIR)/irrigationctl $(BIN_DIR)/irrigationd
+# -------------------------------------------------------------------
+all: $(DAEMON_BIN)
 
-# Build rules
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
+# -------------------------------------------------------------------
+# Build daemon
+# -------------------------------------------------------------------
+$(DAEMON_BIN): $(DAEMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# -------------------------------------------------------------------
+# Build tests
+# -------------------------------------------------------------------
+tests: $(TEST_BINS)
+
+test_auth: $(TEST_AUTH_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+test_rate_limit: $(TEST_RL_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# -------------------------------------------------------------------
+# Generic rule for .o
+# -------------------------------------------------------------------
+%.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BIN_DIR)/irrigationctl: $(IRRIGATIONCTL_OBJS) | $(BIN_DIR)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-
-$(BIN_DIR)/irrigationd: $(IRRIGATIOND_OBJS) | $(BIN_DIR)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-
-# Create build directories if they don't exist
-$(OBJ_DIR) $(BIN_DIR):
-	mkdir -p $@
-
-# Install target
-install: all
-	install -d $(DESTDIR)/usr/local/bin
-	install -m 755 $(BIN_DIR)/* $(DESTDIR)/usr/local/bin/
-	install -d $(DESTDIR)/etc/systemd/system
-	install -m 644 $(SYSTEMD_DIR)/irrigationd.service $(DESTDIR)/etc/systemd/system/
-	install -d $(DESTDIR)/etc/default
-	@if [ ! -f $(DESTDIR)/etc/default/irrigationd ]; then \
-		install -m 644 $(EXAMPLES_DIR)/irrigationd $(DESTDIR)/etc/default/irrigationd; \
-		echo "Installed default /etc/default/irrigationd"; \
-	else \
-		echo "Skipping /etc/default/irrigationd (already exists)"; \
+# -------------------------------------------------------------------
+# Install / uninstall
+# -------------------------------------------------------------------
+install: $(DAEMON_BIN)
+	# Create system user/group if missing
+	if ! id -u irrigationd >/dev/null 2>&1; then \
+	  echo "Creating system user irrigationd..."; \
+	  useradd -r -s /usr/sbin/nologin -d /var/lib/irrigationd -M irrigationd; \
 	fi
 
-# Development target: run irrigationd in foreground
-dev: $(BIN_DIR)/irrigationd
-	IRRIGATIOND_TOKEN=devtoken IRRIGATIOND_BIND_ADDR=127.0.0.1 $(BIN_DIR)/irrigationd
+	# Install daemon binary
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 $(DAEMON_BIN) $(DESTDIR)$(BINDIR)
 
+	# Install systemd service file
+	install -d $(DESTDIR)$(SYSTEMD_DIR)
+	install -m 0644 $(SERVICE_FILE) $(DESTDIR)$(SYSTEMD_DIR)/$(SERVICE_FILE)
+
+	# Install /etc/default/irrigationd if not present
+	install -d $(DESTDIR)$(DEFAULTS_DIR)
+	if [ ! -f $(DESTDIR)$(DEFAULTS_DIR)/irrigationd ]; then \
+	install -m 0640 $(DEFAULTS_FILE) $(DESTDIR)$(DEFAULTS_DIR)/irrigationd; \
+	fi
+	chown root:irrigationd $(DESTDIR)$(DEFAULTS_DIR)/irrigationd
+	chmod 0640 $(DESTDIR)$(DEFAULTS_DIR)/irrigationd
+
+	@echo "Install complete."
+	@echo "Run the following to enable service:"
+	@echo "  systemctl daemon-reexec"
+	@echo "  systemctl enable irrigationd"
+	@echo "  systemctl start irrigationd"
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(DAEMON_BIN)
+	rm -f $(DESTDIR)$(SYSTEMD_DIR)/$(SERVICE_FILE)
+	rm -f $(DESTDIR)$(DEFAULTS_DIR)/irrigationd
+
+# -------------------------------------------------------------------
+# Clean
+# -------------------------------------------------------------------
 clean:
-	rm -rf $(OBJ_DIR) $(BIN_DIR)
+	rm -f $(DAEMON_OBJS) $(TEST_AUTH_OBJS) $(TEST_RL_OBJS) \
+	      $(DAEMON_BIN) $(TEST_BINS)
+
+.PHONY: all tests clean install uninstall

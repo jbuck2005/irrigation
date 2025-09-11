@@ -13,7 +13,17 @@
 // away register-level I²C operations.
 //
 // -----------------------------------------------------------------------------
-
+//
+// The driver is thread-safe by default: callers may optionally provide their
+// own mutex via mcp_enable_thread_safety(), otherwise an internal mutex is
+// used.  The i2c device file descriptor is opened with close-on-exec to avoid
+// leaking descriptors to child processes.
+//
+//                 (verbose documentation starts at column 81)
+//                                                                                 Callers should call mcp_i2c_open() early at startup and call
+//                                                                                 mcp_i2c_close() at shutdown. Use mcp_lock()/mcp_unlock() for
+//                                                                                 multi-operation sequences if fine-grained atomicity is required.
+//
 // Open the MCP23017 on the given I²C device (e.g. "/dev/i2c-1")               //
 int mcp_i2c_open(const char *i2c_device);
 
