@@ -5,26 +5,26 @@
  * This daemon listens on a TCP socket (port 4242) and accepts simple commands
  * of the form:
  *
- *   ZONE=<zone_number> TIME=<seconds>
+ * ZONE=<zone_number> TIME=<seconds>
  *
  * - ZONE ranges from 1..14
  * - TIME=0 turns a zone OFF immediately
  * - TIME=N>0 turns a zone ON for N seconds, then back OFF automatically
  *
  * Features:
- *   - Multi-threaded client handling
- *   - Worker threads for timed zone control
- *   - Shared state protected by mutex
- *   - Clean shutdown via signals (SIGINT/SIGTERM)
- *   - Syslog logging for all lifecycle and error events
- *   - Optional debug mode via environment variable
+ * - Multi-threaded client handling
+ * - Worker threads for timed zone control
+ * - Shared state protected by mutex
+ * - Clean shutdown via signals (SIGINT/SIGTERM)
+ * - Syslog logging for all lifecycle and error events
+ * - Optional debug mode via environment variable
  *
  * Safety/Robustness improvements:
- *   - xmalloc/xrealloc helpers with syslog logging
- *   - FD_CLOEXEC set on all file descriptors to prevent leakage
- *   - pthread_attr_setstacksize to reduce per-thread memory footprint
- *   - Interruptible timers using pthread_cond_timedwait (shutdown cancels timers)
- *   - Worker watchdog to log long-running threads
+ * - xmalloc/xrealloc helpers with syslog logging
+ * - FD_CLOEXEC set on all file descriptors to prevent leakage
+ * - pthread_attr_setstacksize to reduce per-thread memory footprint
+ * - Interruptible timers using pthread_cond_timedwait (shutdown cancels timers)
+ * - Worker watchdog to log long-running threads
  */
 
 #define _POSIX_C_SOURCE 200809L                                                 // Required for sigaction, clock_gettime, etc.
@@ -169,16 +169,21 @@ static void shutdown_signal_handler(int signo) {
 // --- Cleanup ---
 
 static void join_workers_and_cleanup(void) {
-    pthread_mutex_lock(&timer_mutex);
-    pthread_cond_broadcast(&timer_cond);
-    pthread_mutex_unlock(&timer_mutex);
+    pthread_cond_broadcast(&timer_cond);                                        // Wake all sleeping workers so they can exit.
+
+    // Snapshot the worker list to avoid holding the lock while joining threads.
+    size_t count = 0;
+    worker_entry_t *snapshot = NULL;
 
     pthread_mutex_lock(&workers_lock);
-    size_t count = worker_count;
-    worker_entry_t *snapshot = NULL;
-    if (count > 0) {
-        snapshot = malloc(count * sizeof(worker_entry_t));
-        if (snapshot) memcpy(snapshot, worker_list, count * sizeof(worker_entry_t));
+    if (worker_count > 0) {
+        snapshot = malloc(worker_count * sizeof(worker_entry_t));
+        if (snapshot) {
+            memcpy(snapshot, worker_list, worker_count * sizeof(worker_entry_t));
+            count = worker_count;
+        } else {
+            syslog(LOG_ERR, "Failed to malloc for worker snapshot, cannot join.");
+        }
     }
     pthread_mutex_unlock(&workers_lock);
 
@@ -357,8 +362,7 @@ static void *client_thread(void *arg) {
     char buf[CMD_BUF_SZ];
     ssize_t n = read_line(cfd, buf, sizeof(buf));
     if (n > 0) {
-        if (n > 0 && buf[n - 1] == '\n') buf[n - 1] = '\0';
-        if (n > 1 && buf[n - 2] == '\r') buf[n - 2] = '\0';
+        buf[strcspn(buf, "\r\n")] = '\0';                                        // This is a safer way to strip trailing newlines than manual indexing.
         if (parse_command(cfd, buf) < 0) {
             const char err[] = "ERR syntax (use: ZONE=<1..14> TIME=<seconds>)\n";
             write_all(cfd, err, sizeof(err) - 1);
@@ -455,16 +459,20 @@ int main(void) {
         set_cloexec(*cfd);
 
         pthread_t tid;
-        if (pthread_create(&tid, NULL, client_thread, cfd) != 0) {
-            syslog(LOG_ERR, "pthread_create failed for client handler: %s", strerror(errno));
+        pthread_attr_t attr;                                                    // Detached threads don't need a large stack.
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);            // Create the client handler in a detached state.
+        int rc = pthread_create(&tid, &attr, client_thread, cfd);
+        pthread_attr_destroy(&attr);
+
+        if (rc != 0) {
+            syslog(LOG_ERR, "pthread_create failed for client handler: %s", strerror(rc));
             close(*cfd);
             free(cfd);
             continue;
         }
-
-        if (add_worker(tid) != 0) {
-            pthread_detach(tid);
-        }
+        // SAFETY FIX: Do not add client_thread to the worker list. Only long-running
+        // timer threads (worker_thread) should be tracked for joining at shutdown.
     }
 
     if (listen_fd >= 0) {
