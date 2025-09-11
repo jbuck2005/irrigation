@@ -10,27 +10,22 @@ SYSTEMD_DIR := systemd
 EXAMPLES_DIR := examples
 
 # Programs
-PROGRAMS := irrigation irrigationctl irrigationd
+PROGRAMS := irrigationctl irrigationd
 
 # Source files
-IRRIGATION_SRCS   := $(SRC_DIR)/irrigation.c $(SRC_DIR)/mcp23017.c
 IRRIGATIONCTL_SRCS:= $(SRC_DIR)/irrigationctl.c
 IRRIGATIOND_SRCS  := $(SRC_DIR)/irrigationd.c $(SRC_DIR)/mcp23017.c
 
 # Object files
-IRRIGATION_OBJS   := $(IRRIGATION_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
 IRRIGATIONCTL_OBJS:= $(IRRIGATIONCTL_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
 IRRIGATIOND_OBJS  := $(IRRIGATIOND_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
 
 # Default target
-all: $(BIN_DIR)/irrigation $(BIN_DIR)/irrigationctl $(BIN_DIR)/irrigationd
+all: $(BIN_DIR)/irrigationctl $(BIN_DIR)/irrigationd
 
 # Build rules
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
-
-$(BIN_DIR)/irrigation: $(IRRIGATION_OBJS) | $(BIN_DIR)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(BIN_DIR)/irrigationctl: $(IRRIGATIONCTL_OBJS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
