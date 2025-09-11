@@ -1,3 +1,6 @@
+// Change 1: Add this define for clock_gettime() and CLOCK_MONOTONIC
+#define _POSIX_C_SOURCE 199309L
+
 #include "rate_limit.h"
 #include <stdlib.h>
 #include <string.h>
@@ -95,12 +98,10 @@ int rl_check_and_consume(uint32_t ip) {
 
     pthread_mutex_lock(&rl_lock);
 
-    // prune occasionally when table grows
-    if (rl_count_entries_locked() > RL_MAX_ENTRIES) {
-        // table too large => deny new entries conservatively
-        pthread_mutex_unlock(&rl_lock);
-        return 0;
-    }
+    // Change 2: Call the prune function to clean up old entries.
+    // This fixes the bug and removes the "unused function" warning.
+    // The incorrect check that was here has also been removed.
+    rl_prune_locked(now_wall);
 
     // find entry
     struct rl_entry *e = rl_table[h];
@@ -110,7 +111,7 @@ int rl_check_and_consume(uint32_t ip) {
         // create new entry only if under cap
         if (rl_count_entries_locked() >= RL_MAX_ENTRIES) {
             pthread_mutex_unlock(&rl_lock);
-            return 0;
+            return 0; // Table is full, deny creation of new entry
         }
         e = malloc(sizeof(*e));
         if (!e) { pthread_mutex_unlock(&rl_lock); return 0; }
