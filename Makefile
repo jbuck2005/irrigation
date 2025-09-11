@@ -1,50 +1,46 @@
-# Makefile for Irrigation Controller Project
+# Compiler and flags
+CC      := gcc
+CFLAGS  := -Wall -Wextra -O2 -Iinclude
+LDFLAGS := -pthread
 
-CC       := gcc
-CFLAGS   := -Wall -Wextra -O2 -Iinclude
-LDFLAGS  := -pthread
-LDLIBS   := -lrt
-
-SRC_DIR  := src
-INC_DIR  := include
-BUILD_DIR:= build
-BIN_DIR  := bin
+SRC_DIR := src
+OBJ_DIR := build
+BIN_DIR := bin
 SYSTEMD_DIR := systemd
 EXAMPLES_DIR := examples
 
-# Programs to build
+# Programs
 PROGRAMS := irrigation irrigationctl irrigationd
 
 # Source files
-SRC := $(wildcard $(SRC_DIR)/*.c)
+IRRIGATION_SRCS   := $(SRC_DIR)/irrigation.c $(SRC_DIR)/mcp23017.c
+IRRIGATIONCTL_SRCS:= $(SRC_DIR)/irrigationctl.c
+IRRIGATIOND_SRCS  := $(SRC_DIR)/irrigationd.c $(SRC_DIR)/mcp23017.c
 
-# Object files grouped by program
-IRRIGATION_OBJ    := $(BUILD_DIR)/irrigation.o    $(BUILD_DIR)/mcp23017.o
-IRRIGATIONCTL_OBJ := $(BUILD_DIR)/irrigationctl.o
-IRRIGATIOND_OBJ   := $(BUILD_DIR)/irrigationd.o   $(BUILD_DIR)/mcp23017.o
+# Object files
+IRRIGATION_OBJS   := $(IRRIGATION_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+IRRIGATIONCTL_OBJS:= $(IRRIGATIONCTL_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+IRRIGATIOND_OBJS  := $(IRRIGATIOND_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
 
 # Default target
-all: $(BIN_DIR) $(PROGRAMS)
+all: $(BIN_DIR)/irrigation $(BIN_DIR)/irrigationctl $(BIN_DIR)/irrigationd
 
-$(BIN_DIR):
-	mkdir -p $(BIN_DIR)
-
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
-
-# Pattern rule for building object files
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+# Build rules
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Build programs
-irrigation: $(IRRIGATION_OBJ) | $(BIN_DIR)
-	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDLIBS) -o $(BIN_DIR)/$@
+$(BIN_DIR)/irrigation: $(IRRIGATION_OBJS) | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-irrigationctl: $(IRRIGATIONCTL_OBJ) | $(BIN_DIR)
-	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDLIBS) -o $(BIN_DIR)/$@
+$(BIN_DIR)/irrigationctl: $(IRRIGATIONCTL_OBJS) | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-irrigationd: $(IRRIGATIOND_OBJ) | $(BIN_DIR)
-	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDLIBS) -o $(BIN_DIR)/$@
+$(BIN_DIR)/irrigationd: $(IRRIGATIOND_OBJS) | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+# Create build directories if they don't exist
+$(OBJ_DIR) $(BIN_DIR):
+	mkdir -p $@
 
 # Install target
 install: all
@@ -60,19 +56,9 @@ install: all
 		echo "Skipping /etc/default/irrigationd (already exists)"; \
 	fi
 
-# Enable target (reload systemd, enable + start the service)
-enable:
-	systemctl daemon-reexec
-	systemctl enable --now irrigationd.service
+# Development target: run irrigationd in foreground
+dev: $(BIN_DIR)/irrigationd
+	IRRIGATIOND_TOKEN=devtoken IRRIGATIOND_BIND_ADDR=127.0.0.1 $(BIN_DIR)/irrigationd
 
-# Uninstall target
-uninstall:
-	rm -f $(DESTDIR)/usr/local/bin/irrigation
-	rm -f $(DESTDIR)/usr/local/bin/irrigationctl
-	rm -f $(DESTDIR)/usr/local/bin/irrigationd
-	rm -f $(DESTDIR)/etc/systemd/system/irrigationd.service
-	rm -f $(DESTDIR)/etc/default/irrigationd
-
-# Clean target
 clean:
-	rm -rf $(BUILD_DIR) $(BIN_DIR)
+	rm -rf $(OBJ_DIR) $(BIN_DIR)

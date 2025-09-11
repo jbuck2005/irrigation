@@ -1,21 +1,16 @@
-#include <stdio.h>                                                                 // Standard I/O (printf, etc.)
+#include <stdio.h>                                                                 // Standard I/O (fprintf, etc.)
 #include <stdlib.h>                                                                // Memory management, exit codes
 #include <string.h>                                                                // String handling (strstr, strcmp)
 #include <unistd.h>                                                                // POSIX API (read, write, close)
 #include <errno.h>                                                                 // errno variable and strerror()
-#include <fcntl.h>                                                                 // File control options (fcntl)
-#include <signal.h>                                                                // Signal handling (not heavily used here)
 #include <pthread.h>                                                               // POSIX threads for concurrency
 #include <sys/socket.h>                                                            // Sockets API
 #include <netinet/in.h>                                                            // sockaddr_in, htons, INADDR_ANY
 #include <arpa/inet.h>                                                             // inet_ntop, inet_addr
 #include <semaphore.h>                                                             // POSIX semaphores
 #include <sys/types.h>                                                             // Basic system data types
-#include <sys/stat.h>                                                              // File modes for permissions
-#include <syslog.h>                                                                // Syslog logging facility
 #include <time.h>                                                                  // Sleep handling
 #include <sys/time.h>                                                              // struct timeval for timeouts
-#include <stdarg.h>                                                                // Variadic functions
 
 #include "mcp23017.h"                                                              // MCP23017 driver interface
 
@@ -29,7 +24,7 @@
 //   ZONE=1 TIME=30 TOKEN=changeme
 //
 // Commands:
-//   ZONE=n TIME=s [TOKEN=secret]                                                   // Turn zone n ON for s seconds, then OFF
+//   ZONE=n TIME=s [TOKEN=secret]                                                   // Turn zone n ON for s seconds
 //   ZONE=n TIME=0 [TOKEN=secret]                                                   // Turn zone n OFF immediately
 //
 // Token authentication is mandatory: if IRRIGATIOND_TOKEN is not set in the
@@ -61,7 +56,7 @@ static int g_bind_inaddr_any = 0;                                               
 static void *xmalloc(size_t sz) {
     void *p = malloc(sz);
     if (!p) {
-        syslog(LOG_ERR, "malloc(%zu) failed", sz);                                 // Logs to syslog on OOM
+        fprintf(stderr, "malloc(%zu) failed: %s\n", sz, strerror(errno));          // stderr logging
         exit(EXIT_FAILURE);
     }
     return p;
@@ -70,7 +65,7 @@ static void *xmalloc(size_t sz) {
 static void *xrealloc(void *old, size_t sz) {
     void *p = realloc(old, sz);
     if (!p) {
-        syslog(LOG_ERR, "realloc(%zu) failed", sz);                                // Logs and aborts on OOM
+        fprintf(stderr, "realloc(%zu) failed: %s\n", sz, strerror(errno));         // stderr logging
         exit(EXIT_FAILURE);
     }
     return p;
@@ -85,11 +80,6 @@ static void add_worker(pthread_t tid) {
     if (worker_count == worker_capacity) {
         size_t newcap = worker_capacity ? worker_capacity * 2 : 8;                 // Grow exponentially
         pthread_t *newlist = xrealloc(worker_list, newcap * sizeof(pthread_t));
-        if (!newlist) {
-            syslog(LOG_ERR, "Failed to grow worker_list to %zu entries", newcap);
-            pthread_mutex_unlock(&workers_lock);
-            return;
-        }
         worker_list = newlist;
         worker_capacity = newcap;
     }
@@ -113,8 +103,7 @@ static void join_workers_and_cleanup(void) {
     for (size_t i = 0; i < worker_count; i++) {
         int jrc = pthread_join(worker_list[i], NULL);
         if (jrc != 0) {
-            syslog(LOG_WARNING, "pthread_join failed on worker %zu: %s",           // Warn but continue
-                   i, strerror(jrc));
+            fprintf(stderr, "pthread_join failed on worker %zu: %s\n", i, strerror(jrc));
         }
     }
     free(worker_list);
@@ -129,7 +118,7 @@ static void join_workers_and_cleanup(void) {
 
 static void set_zone_state(int zone, int state) {
     if (zone < 1 || zone > MAX_ZONE) {
-        syslog(LOG_ERR, "set_zone_state: invalid zone %d", zone);
+        fprintf(stderr, "set_zone_state: invalid zone %d\n", zone);
         return;
     }
 
@@ -141,7 +130,7 @@ static void set_zone_state(int zone, int state) {
     mcp_set_zone_state(zone, state);                                               // Push state to MCP23017 hardware
     mcp_unlock();
 
-    syslog(LOG_INFO, "Zone %d -> %s", zone, state ? "ON" : "OFF");                 // Lifecycle event logging
+    fprintf(stderr, "Zone %d -> %s\n", zone, state ? "ON" : "OFF");
 }
 
 // -----------------------------------------------------------------------------
@@ -157,12 +146,12 @@ static void *worker_thread(void *arg) {
     struct worker_arg *wa = arg;
 
     if (!wa) {
-        syslog(LOG_WARNING, "worker_thread: null arg");
+        fprintf(stderr, "worker_thread: null arg\n");
         return NULL;
     }
 
     if (sem_wait(&worker_slots) != 0) {
-        syslog(LOG_WARNING, "worker_thread: failed to acquire slot semaphore");
+        fprintf(stderr, "worker_thread: failed to acquire slot semaphore\n");
         free(wa);
         return NULL;
     }
@@ -201,14 +190,14 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
     if (!zone_s || !time_s) {
         const char err[] = "ERR missing ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
-        syslog(LOG_WARNING, "[%s] Rejected command (missing ZONE/TIME): '%s'", addrbuf, cmd);
+        fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME): '%s'\n", addrbuf, cmd);
         return -1;
     }
 
     if (!token || strcmp(token, g_auth_token) != 0) {
         const char err[] = "ERR auth required\n";
         write(cfd, err, sizeof(err) - 1);
-        syslog(LOG_WARNING, "[%s] Rejected command (bad/missing token): '%s'", addrbuf, cmd);
+        fprintf(stderr, "[%s] Rejected command (bad/missing token): '%s'\n", addrbuf, cmd);
         return -1;
     }
 
@@ -218,7 +207,7 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
     if (zone < 1 || zone > MAX_ZONE || duration < 0 || duration > 86400) {        // Enforce 24h max
         const char err[] = "ERR invalid ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
-        syslog(LOG_WARNING, "[%s] Rejected command (invalid zone/time): '%s'", addrbuf, cmd);
+        fprintf(stderr, "[%s] Rejected command (invalid zone/time): '%s'\n", addrbuf, cmd);
         return -1;
     }
 
@@ -229,7 +218,7 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
     pthread_t tid;
     int rc = pthread_create(&tid, NULL, worker_thread, wa);
     if (rc != 0) {
-        syslog(LOG_ERR, "pthread_create failed: %s", strerror(rc));
+        fprintf(stderr, "pthread_create failed: %s\n", strerror(rc));
         free(wa);
         const char err[] = "ERR cannot create worker\n";
         write(cfd, err, sizeof(err) - 1);
@@ -239,7 +228,7 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
 
     const char ok[] = "OK\n";
     write(cfd, ok, sizeof(ok) - 1);
-    syslog(LOG_INFO, "[%s] Accepted command: '%s'", addrbuf, cmd);
+    fprintf(stderr, "[%s] Accepted command: '%s'\n", addrbuf, cmd);
     return 0;
 }
 
@@ -300,7 +289,7 @@ static void *client_thread(void *arg) {
     if (n > 0) {
         parse_command(cfd, buf, addrbuf);
     } else if (n < 0) {
-        syslog(LOG_ERR, "[%s] read from client failed: %s", addrbuf, strerror(errno));
+        fprintf(stderr, "[%s] read from client failed: %s\n", addrbuf, strerror(errno));
     }
 
     close(cfd);
@@ -314,9 +303,6 @@ static void *client_thread(void *arg) {
 // -----------------------------------------------------------------------------
 
 int main(void) {
-    // Use LOG_USER facility so journald always captures logs
-    openlog("irrigationd", LOG_PID | LOG_CONS, LOG_USER);
-
     // Load environment configuration
     g_auth_token = getenv("IRRIGATIOND_TOKEN");
     const char *bind_env = getenv("IRRIGATIOND_BIND_ADDR");
@@ -325,14 +311,14 @@ int main(void) {
     }
 
     if (g_auth_token) {
-        syslog(LOG_INFO, "Token enforcement enabled (IRRIGATIOND_TOKEN is set)");
+        fprintf(stderr, "Token enforcement enabled (IRRIGATIOND_TOKEN is set)\n");
     } else {
-        syslog(LOG_ERR, "IRRIGATIOND_TOKEN is not set, refusing to start insecure");
+        fprintf(stderr, "IRRIGATIOND_TOKEN is not set, refusing to start insecure\n");
         exit(EXIT_FAILURE);
     }
 
     if (mcp_open("/dev/i2c-1") < 0) {
-        syslog(LOG_ERR, "ERROR: Failed to open I2C bus");
+        fprintf(stderr, "ERROR: Failed to open I2C bus\n");
         exit(EXIT_FAILURE);
     }
 
@@ -340,7 +326,7 @@ int main(void) {
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
-        syslog(LOG_ERR, "socket failed: %s", strerror(errno));
+        fprintf(stderr, "socket failed: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
@@ -353,16 +339,16 @@ int main(void) {
     addr.sin_addr.s_addr = g_bind_inaddr_any ? INADDR_ANY : inet_addr("127.0.0.1");
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        syslog(LOG_ERR, "bind failed: %s", strerror(errno));
+        fprintf(stderr, "bind failed: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
     if (listen(listen_fd, 8) < 0) {
-        syslog(LOG_ERR, "listen failed: %s", strerror(errno));
+        fprintf(stderr, "listen failed: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
-    syslog(LOG_INFO, "irrigationd listening on port %d", SERVER_PORT);
+    fprintf(stderr, "irrigationd listening on port %d\n", SERVER_PORT);
 
     while (1) {
         struct sockaddr_in cli;
@@ -370,7 +356,7 @@ int main(void) {
         int cfd = accept(listen_fd, (struct sockaddr *)&cli, &clen);
         if (cfd < 0) {
             if (errno == EINTR) continue;
-            syslog(LOG_ERR, "accept failed: %s", strerror(errno));
+            fprintf(stderr, "accept failed: %s\n", strerror(errno));
             continue;
         }
 
@@ -380,7 +366,7 @@ int main(void) {
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread, carg) != 0) {
-            syslog(LOG_ERR, "pthread_create failed: %s", strerror(errno));
+            fprintf(stderr, "pthread_create failed: %s\n", strerror(errno));
             close(cfd);
             free(carg);
             continue;
@@ -390,6 +376,5 @@ int main(void) {
 
     close(listen_fd);
     join_workers_and_cleanup();
-    closelog();
     return 0;
 }
