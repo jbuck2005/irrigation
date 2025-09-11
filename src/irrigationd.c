@@ -11,6 +11,7 @@
 #include <sys/types.h>                                                             // Basic system data types
 #include <time.h>                                                                  // Sleep handling
 #include <sys/time.h>                                                              // struct timeval for timeouts
+#include <stdint.h>                                                                // For uint8_t
 
 #include "mcp23017.h"                                                              // MCP23017 driver interface
 
@@ -24,11 +25,11 @@
 //   ZONE=1 TIME=30 TOKEN=changeme
 //
 // Commands:
-//   ZONE=n TIME=s [TOKEN=secret]                                                   // Turn zone n ON for s seconds
-//   ZONE=n TIME=0 [TOKEN=secret]                                                   // Turn zone n OFF immediately
+//   ZONE=n TIME=s [TOKEN=secret] turn zone n ON for s seconds
+//   ZONE=n TIME=0 [TOKEN=secret] turn zone n OFF immediately
 //
 // Token authentication is mandatory: if IRRIGATIOND_TOKEN is not set in the
-// environment (via /etc/default/irrigationd), the daemon refuses to start.       // Prevents insecure deployments
+// environment (via /etc/default/irrigationd), the daemon refuses to start.        // Prevents insecure deployments
 //
 // -----------------------------------------------------------------------------
 
