@@ -56,7 +56,7 @@ static const char *g_auth_token = NULL;
 static void *xmalloc(size_t sz) {
     void *p = malloc(sz);
     if (!p) {
-        fprintf(stderr, "malloc(%zu) failed: %s\n", sz, strerror(errno));          // stderr logging
+        fprintf(stderr, "malloc(%zu) failed: %s\n", sz, strerror(errno));
         exit(EXIT_FAILURE);
     }
     return p;
@@ -65,7 +65,7 @@ static void *xmalloc(size_t sz) {
 static void *xrealloc(void *old, size_t sz) {
     void *p = realloc(old, sz);
     if (!p) {
-        fprintf(stderr, "realloc(%zu) failed: %s\n", sz, strerror(errno));         // stderr logging
+        fprintf(stderr, "realloc(%zu) failed: %s\n", sz, strerror(errno));
         exit(EXIT_FAILURE);
     }
     return p;
@@ -116,9 +116,9 @@ static void join_workers_and_cleanup(void) {
 // Zone control
 // -----------------------------------------------------------------------------
 
-static void set_zone_state(int zone, int state) {
+static void set_zone_state(const char *who, int zone, int state) {
     if (zone < 1 || zone > MAX_ZONE) {
-        fprintf(stderr, "set_zone_state: invalid zone %d\n", zone);
+        fprintf(stderr, "set_zone_state: invalid zone %d (by %s)\n", zone, who ? who : "unknown");
         return;
     }
 
@@ -130,7 +130,7 @@ static void set_zone_state(int zone, int state) {
     mcp_set_zone_state(zone, state);
     mcp_unlock();
 
-    fprintf(stderr, "Zone %d -> %s\n", zone, state ? "ON" : "OFF");
+    fprintf(stderr, "[%s] Zone %d -> %s\n", who ? who : "unknown", zone, state ? "ON" : "OFF");
 }
 
 // -----------------------------------------------------------------------------
@@ -140,6 +140,7 @@ static void set_zone_state(int zone, int state) {
 struct worker_arg {
     int zone;
     int duration;
+    char who[64];
 };
 
 static void *worker_thread(void *arg) {
@@ -156,10 +157,10 @@ static void *worker_thread(void *arg) {
         return NULL;
     }
 
-    set_zone_state(wa->zone, 1);
+    set_zone_state(wa->who, wa->zone, 1);
     if (wa->duration > 0) {
         sleep(wa->duration);                                                       // Blocks this thread only
-        set_zone_state(wa->zone, 0);
+        set_zone_state(wa->who, wa->zone, 0);
     }
 
     free(wa);
@@ -172,7 +173,6 @@ static void *worker_thread(void *arg) {
 // Command parser
 // -----------------------------------------------------------------------------
 
-// Extract key=value pairs from the command string
 static char *get_kv(const char *cmd, const char *key) {
     size_t klen = strlen(key);
     const char *p = strstr(cmd, key);
@@ -204,7 +204,7 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
     int zone = atoi(zone_s);
     int duration = atoi(time_s);
 
-    if (zone < 1 || zone > MAX_ZONE || duration < 0 || duration > 86400) {        // Enforce 24h max
+    if (zone < 1 || zone > MAX_ZONE || duration < 0 || duration > 86400) {
         const char err[] = "ERR invalid ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (invalid zone/time): '%s'\n", addrbuf, cmd);
@@ -213,7 +213,7 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
 
     // Special case: TIME=0 → turn OFF immediately, no worker
     if (duration == 0) {
-        set_zone_state(zone, 0);
+        set_zone_state(addrbuf, zone, 0);
         const char ok[] = "OK\n";
         write(cfd, ok, sizeof(ok) - 1);
         fprintf(stderr, "[%s] Zone %d OFF (immediate stop)\n", addrbuf, zone);
@@ -224,6 +224,7 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
     struct worker_arg *wa = xmalloc(sizeof(struct worker_arg));
     wa->zone = zone;
     wa->duration = duration;
+    snprintf(wa->who, sizeof(wa->who), "%s", addrbuf);
 
     pthread_t tid;
     int rc = pthread_create(&tid, NULL, worker_thread, wa);
@@ -246,7 +247,6 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
 // Client thread handler (per connection)
 // -----------------------------------------------------------------------------
 
-// Format a client address (IPv4) into "ip:port"
 static void format_client_addr(const struct sockaddr_in *cli, char *buf, size_t sz) {
     char ip[INET_ADDRSTRLEN];
     if (!inet_ntop(AF_INET, &cli->sin_addr, ip, sizeof(ip))) {
@@ -265,9 +265,9 @@ static ssize_t read_line(int fd, char *buf, size_t sz) {
             if (c == '\n') break;
             buf[i++] = c;
         } else if (rc == 0) {
-            break;                                                                 // EOF
+            break;
         } else {
-            if (errno == EINTR) continue;                                          // Retry if interrupted
+            if (errno == EINTR) continue;
             return -1;
         }
     }
@@ -313,8 +313,6 @@ static void *client_thread(void *arg) {
 // -----------------------------------------------------------------------------
 
 int main(void) {
-    // Use stderr logging (systemd captures stdout/stderr)
-    // Load environment configuration
     g_auth_token = getenv("IRRIGATIOND_TOKEN");
     const char *bind_env = getenv("IRRIGATIOND_BIND_ADDR");
     struct in_addr bind_addr = {0};
