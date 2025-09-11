@@ -44,6 +44,8 @@
  * echo "ZONE=5 TIME=0" | netcat localhost 4242
  */
 
+#define _POSIX_C_SOURCE 200809L                                                         // Ensure POSIX signal and threading APIs are available
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +56,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 
 #include "mcp23017.h"                                                           // MCP23017 driver
 
@@ -66,18 +70,81 @@
 static int zone_state[MAX_ZONE + 1];                                            // Software mirror of zone states (0=OFF, 1=ON)
                                                                                 //                                                                               
 /* ADDITIONAL DOC: The zone_state[] array is protected by the MCP driver's mutex  */
-/* The driver exposes mcp_lock/mcp_unlock (no-op if no mutex)   */
-/* callers must use mcp_lock/mcp_unlock when performing a      */
-/* composite operation that touches hardware AND zone_state[]  */
+// The driver exposes mcp_lock/mcp_unlock (no-op if no mutex) callers must use mcp_lock/mcp_unlock
+// when performing a composite operation that touches hardware AND zone_state[]
 
 static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;                   // Mutex to protect access to zone_state and hardware
                                                                                 //                                                                               
 /* ADDITIONAL DOC: The zone_lock is intended to be shared with the driver using  */
-/* mcp_enable_thread_safety(&zone_lock). The preferred usage  */
-/* pattern is to call mcp_lock()/mcp_unlock() around driver   */
-/* operations that must be atomic with updates to zone_state.  */
+// mcp_enable_thread_safety(&zone_lock). The preferred usage pattern is to call mcp_lock()/mcp_unlock() around driver
+// operations that must be atomic with updates to zone_state.
 
-/* Prototypes for mcp_lock()/mcp_unlock() are now in mcp23017.h, no need here. */
+/* Prototypes for mcp_lock()/mcp_unlock() are in the header. */
+
+/* --- Thread tracking for graceful shutdown --- */
+static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;                // Protects worker list
+static pthread_t *worker_list = NULL;                                           // Dynamically-grown list of worker + client threads
+static size_t worker_count = 0;
+static size_t worker_capacity = 0;
+
+// We track created threads (both client handlers and timed worker threads) instead of detaching them so we can join them on shutdown.
+// This lets the daemon clean up resources and guarantees orderly hardware shutdown (turning off all zones) before exit.
+
+/* Listening socket (global so the signal handler can close it) */
+static int listen_fd = -1;
+
+/* Running flag: when set to 0 the main accept loop exits */
+static volatile sig_atomic_t running = 1;
+
+// The signal handler sets `running = 0` and closes the listening socket (close is async-signal-safe).
+// The main thread observes running and performs orderly shutdown.
+
+/* --- Helper: safe write_all (handles partial writes) --- */
+static ssize_t write_all(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = write(fd, p, remaining);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += n;
+        remaining -= (size_t)n;
+    }
+    return (ssize_t)len;
+}
+
+// write_all() ensures that all bytes are written to the socket even if write() is interrupted or performs a short write.
+// This replaces single-shot write() uses to make network I/O robust under stress.
+
+/* --- Thread list helpers --- */
+static int add_worker(pthread_t tid)
+{
+    int rc = 0;
+    if (pthread_mutex_lock(&workers_lock) != 0) return -1;
+    if (worker_count == worker_capacity) {
+        size_t newcap = worker_capacity == 0 ? 16 : worker_capacity * 2;
+        pthread_t *n = realloc(worker_list, newcap * sizeof(pthread_t));
+        if (!n) {
+            rc = -1;
+            goto out;
+        }
+        worker_list = n;
+        worker_capacity = newcap;
+    }
+    worker_list[worker_count++] = tid;
+out:
+    pthread_mutex_unlock(&workers_lock);
+    return rc;
+}
+
+// We do not remove entries when threads finish; we collect and join all entries during shutdown. This keeps the implementation simple and safe.
+
+/* --- Forward declarations --- */
+static void shutdown_signal_handler(int signo);
+static void join_workers_and_cleanup(void);
 
 /**
  * @brief Sets the state of a specific irrigation zone.
@@ -100,10 +167,7 @@ static void set_zone_state(int zone, int state)
         return;
     }
 
-    /* Acquire driver-provided lock to make the following sequence atomic:
-     *    hardware update + software mirror update
-     */
-    mcp_lock();
+    mcp_lock(); // Acquire driver-provided lock to make the following sequence atomic: hardware update + software mirror update
 
     if (mcp_set_zone_state(zone, state) != 0) {
         fprintf(stderr, "ERROR: Failed to set zone %d -> %s\n", zone, state ? "ON" : "OFF");
@@ -163,9 +227,9 @@ static int parse_command(int cfd, const char *line)
     if (t == 0) {                                                               // TIME=0: Turn the zone OFF immediately. No new thread is needed.
         set_zone_state(z, 0);
         const char ok[] = "OK\n";
-        (void)write(cfd, ok, sizeof(ok) - 1);                                   // Send confirmation
+        (void)write_all(cfd, ok, sizeof(ok) - 1);                                // Send confirmation using write_all
         return 0;
-    } else {                                                                    // TIME>0: Spawn a detached worker thread to handle the timed activation.
+    } else {                                                                    // TIME>0: Spawn a worker thread to handle the timed activation.
         pthread_t tid;
         int *args = malloc(2 * sizeof(int));
         if (!args) {
@@ -180,9 +244,16 @@ static int parse_command(int cfd, const char *line)
             free(args);                                                         // Clean up on failure
             return -1;
         }
-        pthread_detach(tid);                                                    // Detach the thread so its resources are automatically freed on exit
+        /*
+         * Do NOT detach. We instead keep the thread handle so we can join it on shutdown.
+         * This ensures a clean shutdown where the kernel resources are reclaimed after thread exit.
+         */
+        if (add_worker(tid) != 0) {
+            pthread_detach(tid);                                                // If we cannot track the thread, detach it as a fallback to avoid leaks.
+        }
+
         const char ok[] = "OK\n";
-        (void)write(cfd, ok, sizeof(ok) - 1);                                   // Send confirmation
+        (void)write_all(cfd, ok, sizeof(ok) - 1);                                // Send confirmation using write_all
         return 0;
     }
 }
@@ -202,17 +273,17 @@ static ssize_t read_line(int fd, char *buf, size_t sz)
     size_t used = 0;
     while (used < sz - 1) {
         ssize_t n = read(fd, buf + used, 1);
-        if (n == 0) {                     // EOF
+        if (n == 0) {                                                           // EOF
             break;
         } else if (n < 0) {
-            if (errno == EINTR) continue; // try again
-            return -1;                    // other error
+            if (errno == EINTR) continue;                                       // try again
+            return -1;                                                          // other error
         } else {
-            if (buf[used] == '\r') {      // skip CR
+            if (buf[used] == '\r') {                                            // skip CR
                 continue;
             }
             used++;
-            if (buf[used - 1] == '\n') {  // newline terminator found
+            if (buf[used - 1] == '\n') {                                        // newline terminator found
                 break;
             }
         }
@@ -233,17 +304,15 @@ static void *client_thread(void *arg)
 {
     int cfd = *(int *)arg;
     free(arg);
-
     char buf[CMD_BUF_SZ];
     ssize_t n = read_line(cfd, buf, sizeof(buf));
     if (n > 0) {
-        // strip trailing newline for robust parsing
-        if (n > 0 && buf[n - 1] == '\n') buf[n - 1] = '\0';
+        if (n > 0 && buf[n - 1] == '\n') buf[n - 1] = '\0';                     // strip trailing newline for robust parsing
         if (n > 1 && buf[n - 2] == '\r') buf[n - 2] = '\0';
 
         if (parse_command(cfd, buf) < 0) {                                      // If command parsing fails, send a helpful error message
             const char err[] = "ERR syntax (use: ZONE=<1..14> TIME=<seconds>)\n";
-            (void)write(cfd, err, sizeof(err) - 1);
+            (void)write_all(cfd, err, sizeof(err) - 1);
         }
     } else if (n == 0) {
         // no data from client; ignore quietly
@@ -254,40 +323,96 @@ static void *client_thread(void *arg)
     return NULL;
 }
 
+// Signal handler: close the listen socket and mark running=0.
+// Only uses async-signal-safe functions (close, write to STDERR_FILENO if needed).
+ 
+static void shutdown_signal_handler(int signo)
+{
+    (void)signo;
+    running = 0;
+    if (listen_fd >= 0) {
+        close(listen_fd);                                                       // close is async-signal-safe per POSIX
+        listen_fd = -1;
+    }
+}
+
+/* Join tracked worker threads and perform final cleanup:
+ *  - join worker threads recorded in worker_list
+ *  - free worker_list
+ *  - ensure all zones are turned off
+ *  - close mcp i2c and other resources
+ */
+static void join_workers_and_cleanup(void)
+{
+    /* Join worker threads */
+    if (pthread_mutex_lock(&workers_lock) == 0) {
+        for (size_t i = 0; i < worker_count; ++i) {
+            pthread_join(worker_list[i], NULL);
+        }
+        free(worker_list);
+        worker_list = NULL;
+        worker_count = 0;
+        worker_capacity = 0;
+        pthread_mutex_unlock(&workers_lock);
+    }
+
+    /* Turn off all zones (ensure hardware and software mirrors are consistent) */
+    mcp_lock();
+    for (int z = 1; z <= MAX_ZONE; ++z) {
+        if (zone_state[z] != 0) {                                               // Only change if currently ON to reduce I2C traffic
+            mcp_set_zone_state(z, 0);
+            zone_state[z] = 0;
+        }
+    }
+    mcp_unlock();
+    mcp_i2c_close();                                                            // Close I2C bus
+}
+
 /**
  * @brief Main program entry point.
  * @description Initializes the MCP23017 hardware, sets up a TCP listening
  * socket, and enters an infinite loop to accept and handle
  * incoming client connections. Each client is handled in a
- * separate, detached thread.
- * @return 0 on successful shutdown (practically unreachable), or
- * EXIT_FAILURE on a fatal initialization error.
+ * separate thread which is tracked for orderly shutdown.
+ * @return 0 on successful shutdown, or EXIT_FAILURE on a fatal initialization error.
  */
 int main(void)
 {
-    // --- Hardware Initialization ---
+    /* Install signal handlers for graceful shutdown */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = shutdown_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    /* --- Hardware Initialization --- */
     if (mcp_i2c_open("/dev/i2c-1") < 0) {
         fprintf(stderr, "ERROR: Failed to open I2C bus\n");
         exit(EXIT_FAILURE);
     }
     if (mcp_config_outputs() < 0) {
         fprintf(stderr, "ERROR: Failed to configure MCP23017 outputs\n");
+        mcp_i2c_close();
         exit(EXIT_FAILURE);
     }
     mcp_enable_thread_safety(&zone_lock);                                       // Share the main application's mutex with the hardware driver for thread safety
 
-    // --- TCP Server Setup ---
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sfd < 0) {
+    /* --- TCP Server Setup --- */
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
         perror("socket");
+        mcp_i2c_close();
         exit(EXIT_FAILURE);
     }
 
     // Allow immediate reuse of the port after the daemon is restarted
     int opt = 1;
-    if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt");
-        close(sfd);
+        close(listen_fd);
+        mcp_i2c_close();
         exit(EXIT_FAILURE);
     }
 
@@ -297,40 +422,46 @@ int main(void)
     addr.sin_port        = htons(SERVER_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
-        close(sfd);
+        close(listen_fd);
+        mcp_i2c_close();
         exit(EXIT_FAILURE);
     }
 
-    if (listen(sfd, BACKLOG) < 0) {
+    if (listen(listen_fd, BACKLOG) < 0) {
         perror("listen");
-        close(sfd);
+        close(listen_fd);
+        mcp_i2c_close();
         exit(EXIT_FAILURE);
     }
 
     printf("irrigationd listening on port %d\n", SERVER_PORT);
 
-    // --- Main Accept Loop ---
-    while (1) {
+    /* --- Main Accept Loop --- */
+    while (running) {
         struct sockaddr_in cli;
         socklen_t len = sizeof(cli);
-        
-        // Allocate memory for the client fd to pass to the new thread safely
+
         int *cfd = malloc(sizeof(int));
         if (!cfd) {
             perror("malloc");
-            continue;
-        }
-        
-        *cfd = accept(sfd, (struct sockaddr *)&cli, &len);
-        if (*cfd < 0) {
-            perror("accept");
-            free(cfd);
+            sleep(1);                                                           // If malloc fails, short sleep to avoid tight loop then continue
             continue;
         }
 
-        // Create a new thread to handle the client connection
+        *cfd = accept(listen_fd, (struct sockaddr *)&cli, &len);
+        if (*cfd < 0) {
+            int err = errno;
+            free(cfd);
+            if (!running) break;                                                // shutdown requested
+            if (err == EINTR) continue;                                         // interrupted by signal
+            perror("accept");
+            continue;
+        }
+
+        // Create a new thread to handle the client connection.
+        // We do not detach: threads are tracked and joined at shutdown.
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread, cfd) != 0) {
             perror("pthread_create");
@@ -338,11 +469,16 @@ int main(void)
             free(cfd);
             continue;
         }
-        pthread_detach(tid);                                                    // Detach the thread so its resources are automatically freed upon exit
+        if (add_worker(tid) != 0) {
+            pthread_detach(tid);                                                // If we cannot track this thread, detach as a fallback to avoid leaks.
+        }
     }
 
-    // --- Clean Shutdown (rarely reached in a daemon) ---
-    mcp_i2c_close();
-    close(sfd);
+    if (listen_fd >= 0) {
+        close(listen_fd);                                                       // Listen socket may already be closed by signal handler; ensure it's closed
+        listen_fd = -1;
+    }
+    join_workers_and_cleanup();                                                 // Shutdown: join threads and cleanup hardware
+
     return 0;
 }
