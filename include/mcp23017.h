@@ -1,60 +1,118 @@
-/*
- * mcp23017.h                                                                                     // Header for MCP23017 irrigation control helper
+/**
+ * @file mcp23017.h
+ * @author James Buck
+ * @date September 10, 2025
+ * @brief Public API for the MCP23017 irrigation driver.
  *
- * Provides:                                                                                      // - Register definitions
- *                                                                                                // - Zone mapping 1..14 → MCP register/bit
- *                                                                                                // - Public functions for opening/closing I²C,
- *                                                                                                //   configuring outputs, and setting zone state
+ * @description
+ * This header defines constants, macros, and function prototypes
+ * for controlling an MCP23017 I/O expander in the context of an irrigation system.
+ *
+ * The MCP23017 is an I2C device with two 8-bit GPIO ports (A and B).
+ * In this system:
+ *   - Zones 1–8 are mapped to GPA0–GPA7
+ *   - Zones 9–14 are mapped to GPB5–GPB0 (reversed order for wiring convenience)
+ *
+ * Features:
+ *   - Initialization and configuration of MCP23017 registers
+ *   - Zone mapping logic (abstract zone numbers to registers/pins)
+ *   - Zone ON/OFF control
+ *   - Optional thread safety (external mutex integration)
+ *
+ * Usage:
+ *   - Call mcp_i2c_open("/dev/i2c-X") to open the I²C bus
+ *   - Call mcp_config_outputs() to configure all pins as outputs
+ *   - Call mcp_enable_thread_safety(&mutex) if multi-threading is used
+ *   - Use mcp_set_zone_state(zone, on) to control zones
+ *   - Always call mcp_i2c_close() at shutdown
  */
 
 #ifndef MCP23017_H
 #define MCP23017_H
 
-#include <stdint.h>                                                                               // uint8_t
-#include <pthread.h>                                                                              // pthread_mutex_t (daemon build)
+#include <stdint.h>                                                             // For fixed-width integer types like uint8_t
+#include <pthread.h>                                                            // For pthread_mutex_t when enabling thread safety
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+// --- MCP23017 I2C Address ---
+#define MCPADDR   0x20                                                          // Default I2C address for MCP23017 (configurable with hardware pins)
 
-// ------------------------------ MCP23017 register addresses (BANK=0) ---------------------------
+// --- MCP23017 Register Map (BANK=0 mode) ---
+#define IODIRA    0x00                                                          // I/O direction register for Port A (1 = input, 0 = output)
+#define IODIRB    0x01                                                          // I/O direction register for Port B
+#define GPIOA     0x12                                                          // General Purpose I/O register for Port A (read/write pin states)
+#define GPIOB     0x13                                                          // General Purpose I/O register for Port B
 
-static const uint8_t IODIRA = 0x00;                                                               // Direction register A (1=input, 0=output)
-static const uint8_t IODIRB = 0x01;                                                               // Direction register B
-static const uint8_t GPIOA  = 0x12;                                                               // Port A data register
-static const uint8_t GPIOB  = 0x13;                                                               // Port B data register
-static const uint8_t OLATA  = 0x14;                                                               // Output latch A
-static const uint8_t OLATB  = 0x15;                                                               // Output latch B
+// --- Function Prototypes ---
 
-#define MCPADDR 0x20                                                                              // MCP23017 I²C address (A2..A0 = 000)
-#define MAX_ZONE 14                                                                               // Valid zones: 1..14
+/**
+ * @brief Open I²C device and configure slave address.
+ *
+ * @param devnode Path to I²C device node (e.g., "/dev/i2c-1")
+ * @return 0 on success, -1 on failure
+ */
+int mcp_i2c_open(const char *devnode);
 
-// ------------------------------ API ------------------------------------------------------------
+/**
+ * @brief Close the I²C device.
+ */
+void mcp_i2c_close(void);
 
-// Open and close the I²C device                                                                  //
-int     mcp_i2c_open(const char *devnode);                                                        // Returns 0 on success, -1 on error
-void    mcp_i2c_close(void);                                                                      // Safe to call multiple times
+/**
+ * @brief Configure all MCP23017 pins as outputs.
+ *
+ * @return 0 on success, -1 on failure
+ */
+int mcp_config_outputs(void);
 
-// Configure all MCP23017 pins as outputs                                                          //
-int     mcp_config_outputs(void);                                                                 // Returns 0 on success
+/**
+ * @brief Map a logical zone to the corresponding MCP23017 register and bit mask.
+ *
+ * @param zone Zone number (1–14)
+ * @param reg Output parameter: target register (GPIOA or GPIOB)
+ * @param mask Output parameter: bitmask for the target pin
+ * @return 0 on success, -1 on invalid zone
+ */
+int mcp_map_zone(int zone, uint8_t *reg, uint8_t *mask);
 
-// Map a zone number (1..14) to a register address and bitmask                                     //
-int     mcp_map_zone(int zone, uint8_t *reg, uint8_t *mask);                                      // Returns 0 if valid, -1 if invalid
+/**
+ * @brief Set the ON/OFF state of a zone.
+ *
+ * Important: This function does NOT perform internal locking.
+ * The caller should call mcp_lock() / mcp_unlock() if thread safety is required.
+ *
+ * @param zone Zone number (1–14)
+ * @param on 1 = ON, 0 = OFF
+ * @return 0 on success, -1 on failure
+ */
+int mcp_set_zone_state(int zone, int on);
 
-// Set a zone ON (1) or OFF (0)                                                                   //
-int     mcp_set_zone_state(int zone, int on);                                                     // Returns 0 on success
+/**
+ * @brief Enable thread safety by passing an external mutex.
+ *
+ * After calling this, all internal locking is done using the provided mutex.
+ * This allows consistent atomicity between driver operations and higher-level
+ * application state (e.g., zone_state[] array in irrigationd).
+ *
+ * Example:
+ *   pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
+ *   mcp_enable_thread_safety(&zone_lock);
+ */
+void mcp_enable_thread_safety(pthread_mutex_t *external_mutex);
 
-// Optional: initialize mutex protection for multithreaded daemons                                //
-void    mcp_enable_thread_safety(pthread_mutex_t *external_mutex);                                // Pass a pointer to daemon’s mutex
+/**
+ * @brief Lock the driver's mutex (if configured).
+ *
+ * This function should be used by applications when they need to ensure
+ * that a sequence of operations on both driver and application state
+ * is atomic.
+ */
+void mcp_lock(void);
 
-// Explicit lock/unlock helpers for atomic operations                                             //
-void    mcp_lock(void);                                                                           // Locks the shared mutex if enabled (no-op otherwise)
-void    mcp_unlock(void);                                                                         // Unlocks the shared mutex if enabled (no-op otherwise)
-// Callers should wrap composite sequences (e.g., hw + sw updates) in mcp_lock/mcp_unlock
-// This ensures hardware and zone_state[] mirror remain consistent without deadlocks
-
-#ifdef __cplusplus
-}
-#endif
+/**
+ * @brief Unlock the driver's mutex (if configured).
+ *
+ * Complements mcp_lock(). Safe to call even if no mutex was configured.
+ */
+void mcp_unlock(void);
 
 #endif // MCP23017_H
