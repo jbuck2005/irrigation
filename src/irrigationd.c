@@ -15,11 +15,28 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/time.h>           // For struct timeval and setsockopt
-#include <string.h>             // For strdup and strtok_r
 
 // Fallback for strdup if it's not available
 #ifndef strdup
-#define strdup(s) ({ size_t len = strlen(s) + 1; char *dup = malloc(len); if (dup) memcpy(dup, s, len); dup; })
+char *strdup(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *dup = malloc(len);
+    if (dup) memcpy(dup, s, len);
+    return dup;
+}
+#endif
+
+// Fallback for strlcpy if it's not available
+#ifndef strlcpy
+#define strlcpy(dst, src, size) ({ \
+    size_t len = strlen(src); \
+    if (size > 0) { \
+        size_t copy_len = (len >= size) ? (size - 1) : len; \
+        memcpy(dst, src, copy_len); \
+        dst[copy_len] = '\0'; \
+    } \
+    len; \
+})
 #endif
 
 #include "mcp23017.h"
@@ -28,15 +45,6 @@
 
 // -----------------------------------------------------------------------------
 // irrigationd.c - Irrigation controller daemon (modularized & hardened)
-// -----------------------------------------------------------------------------
-//
-// Responsibilities:
-//   - Accept TCP connections
-//   - Enforce per-IP rate limiting (rate_limit.[ch])
-//   - Authenticate commands (auth.[ch])
-//   - Parse irrigation commands and manage worker threads
-//   - Control MCP23017 GPIO expander
-//
 // -----------------------------------------------------------------------------
 
 #define SERVER_PORT     4242
