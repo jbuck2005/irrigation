@@ -87,6 +87,8 @@ void mcp_lock(void);
  */
 void mcp_unlock(void);
 
+int mcp_open(const char *i2c_device);
+
 #ifdef __cplusplus
 }
 #endif
