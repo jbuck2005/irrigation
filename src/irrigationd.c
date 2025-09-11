@@ -1,5 +1,5 @@
-// Define POSIX source for clock_gettime and CLOCK_MONOTONIC
-#define _POSIX_C_SOURCE 199309L
+// Change 1: Update the POSIX source version to guarantee strdup is available.
+#define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -214,9 +214,9 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
 
     // copy safely and ensure NUL termination
     char buf[CMD_BUF_SZ];
-    memset(buf, 0, sizeof(buf));
-    strncpy(buf, cmd, sizeof(buf)-1);
-    buf[sizeof(buf)-1] = '\0';
+
+    // Change 2: Replace strncpy block with a single, safer snprintf call.
+    snprintf(buf, sizeof(buf), "%s", cmd);
 
     char *saveptr=NULL, *tok=strtok_r(buf, " \t\r\n", &saveptr);
     while (tok) {
@@ -231,9 +231,10 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
         }
         tok=strtok_r(NULL," \t\r\n",&saveptr);
     }
-
+    
+    // Change 3: Cast all `write` calls to (void) to silence warnings.
     if (!have_zone||!have_time||!have_token) {
-        write(cfd,"ERR missing fields\n",19);
+        (void)write(cfd,"ERR missing fields\n",19);
         return -1;
     }
 
@@ -245,7 +246,7 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
         char redacted[128];
         sanitize_cmd_for_log(cmd, redacted, sizeof(redacted));
         fprintf(stderr, "[%s] rejected (bad token): %s\n", addrbuf, redacted);
-        write(cfd,"ERR auth required\n",18);
+        (void)write(cfd,"ERR auth required\n",18);
         return -1;
     }
 
@@ -254,30 +255,30 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
     errno = 0;
     long z = strtol(zone_s, &endptr, 10);
     if (endptr == zone_s || errno != 0) {
-        write(cfd,"ERR invalid ZONE\n",17);
+        (void)write(cfd,"ERR invalid ZONE\n",17);
         return -1;
     }
     errno = 0;
     long t = strtol(time_s, &endptr, 10);
     if (endptr == time_s || errno != 0) {
-        write(cfd,"ERR invalid TIME\n",17);
+        (void)write(cfd,"ERR invalid TIME\n",17);
         return -1;
     }
 
     if (z < 1 || z > MAX_ZONE || t < 0 || t > 86400) {
-        write(cfd,"ERR invalid\n",12);
+        (void)write(cfd,"ERR invalid\n",12);
         return -1;
     }
 
     if (t == 0) {
         set_zone_state(addrbuf, (int)z, 0);
-        write(cfd, "OK\n", 3);
+        (void)write(cfd, "OK\n", 3);
         return 0;
     }
 
     // Acquire worker slot (non-blocking)
     if (sem_trywait(&worker_slots) != 0) {
-        write(cfd,"ERR busy\n",9);
+        (void)write(cfd,"ERR busy\n",9);
         return -1;
     }
 
@@ -290,11 +291,11 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
     if (pthread_create(&tid, NULL, worker_thread, wa) != 0) {
         free(wa);
         sem_post(&worker_slots);
-        write(cfd, "ERR thread\n", 11);
+        (void)write(cfd, "ERR thread\n", 11);
         return -1;
     }
     add_worker(tid);
-    write(cfd, "OK\n", 3);
+    (void)write(cfd, "OK\n", 3);
 
     char redacted[128];
     sanitize_cmd_for_log(cmd, redacted, sizeof(redacted));
@@ -322,7 +323,7 @@ static void *client_thread(void *arg) {
         parse_command(cfd, buf, addrbuf);
     } else if (n == -2) {
         // timeout
-        write(cfd, "ERR timeout\n", 12);
+        (void)write(cfd, "ERR timeout\n", 12);
     } else if (n < 0) {
         fprintf(stderr, "[%s] read from client failed: %s\n", addrbuf, strerror(errno));
     }
@@ -393,7 +394,7 @@ int main(void) {
 
         uint32_t ip = ntohl(cli.sin_addr.s_addr);
         if (!rl_check_and_consume(ip)) {
-            write(cfd, "ERR rate limit\n", 15);
+            (void)write(cfd, "ERR rate limit\n", 15);
             close(cfd);
             continue;
         }
