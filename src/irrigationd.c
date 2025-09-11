@@ -52,7 +52,6 @@ static int g_bind_inaddr_any = 0;                                               
 // -----------------------------------------------------------------------------
 // Utility: memory-safe allocation wrappers
 // -----------------------------------------------------------------------------
-
 static void *xmalloc(size_t sz) {
     void *p = malloc(sz);
     if (!p) {
@@ -74,7 +73,6 @@ static void *xrealloc(void *old, size_t sz) {
 // -----------------------------------------------------------------------------
 // Worker tracking (to ensure clean shutdown and prevent leaks)
 // -----------------------------------------------------------------------------
-
 static void add_worker(pthread_t tid) {
     pthread_mutex_lock(&workers_lock);
     if (worker_count == worker_capacity) {
@@ -115,7 +113,6 @@ static void join_workers_and_cleanup(void) {
 // -----------------------------------------------------------------------------
 // Zone control helpers
 // -----------------------------------------------------------------------------
-
 static void set_zone_state(int zone, int state) {
     if (zone < 1 || zone > MAX_ZONE) {
         fprintf(stderr, "set_zone_state: invalid zone %d\n", zone);
@@ -136,7 +133,6 @@ static void set_zone_state(int zone, int state) {
 // -----------------------------------------------------------------------------
 // Worker thread: executes timed zone control
 // -----------------------------------------------------------------------------
-
 struct worker_arg {
     int zone;
     int duration;
@@ -171,8 +167,6 @@ static void *worker_thread(void *arg) {
 // -----------------------------------------------------------------------------
 // Command parser
 // -----------------------------------------------------------------------------
-
-// Extract key=value pairs from the command string
 static char *get_kv(const char *cmd, const char *key) {
     size_t klen = strlen(key);
     const char *p = strstr(cmd, key);
@@ -235,8 +229,6 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
 // -----------------------------------------------------------------------------
 // Client thread handler (per connection)
 // -----------------------------------------------------------------------------
-
-// Format a client address (IPv4) into "ip:port"
 static void format_client_addr(const struct sockaddr_in *cli, char *buf, size_t sz) {
     char ip[INET_ADDRSTRLEN];
     if (!inet_ntop(AF_INET, &cli->sin_addr, ip, sizeof(ip))) {
@@ -301,7 +293,6 @@ static void *client_thread(void *arg) {
 // -----------------------------------------------------------------------------
 // Main server loop
 // -----------------------------------------------------------------------------
-
 int main(void) {
     // Load environment configuration
     g_auth_token = getenv("IRRIGATIOND_TOKEN");
@@ -317,7 +308,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
-    if (mcp_open("/dev/i2c-1") < 0) {
+    if (mcp_i2c_open("/dev/i2c-1") < 0) {
         fprintf(stderr, "ERROR: Failed to open I2C bus\n");
         exit(EXIT_FAILURE);
     }
