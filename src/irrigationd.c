@@ -6,12 +6,12 @@
 #include <pthread.h>                                                               // POSIX threads for concurrency
 #include <sys/socket.h>                                                            // Sockets API
 #include <netinet/in.h>                                                            // sockaddr_in, htons, INADDR_ANY
-#include <arpa/inet.h>                                                             // inet_ntop, inet_addr
+#include <arpa/inet.h>                                                             // inet_ntop, inet_addr, inet_pton
 #include <semaphore.h>                                                             // POSIX semaphores
 #include <sys/types.h>                                                             // Basic system data types
 #include <time.h>                                                                  // Sleep handling
 #include <sys/time.h>                                                              // struct timeval for timeouts
-#include <stdint.h>                                                                // For uint8_t
+#include <stdarg.h>                                                                // Variadic functions
 
 #include "mcp23017.h"                                                              // MCP23017 driver interface
 
@@ -25,11 +25,11 @@
 //   ZONE=1 TIME=30 TOKEN=changeme
 //
 // Commands:
-//   ZONE=n TIME=s [TOKEN=secret] turn zone n ON for s seconds
-//   ZONE=n TIME=0 [TOKEN=secret] turn zone n OFF immediately
+//   ZONE=n TIME=s [TOKEN=secret]                                                   // Turn zone n ON for s seconds
+//   ZONE=n TIME=0 [TOKEN=secret]                                                   // Turn zone n OFF immediately
 //
 // Token authentication is mandatory: if IRRIGATIOND_TOKEN is not set in the
-// environment (via /etc/default/irrigationd), the daemon refuses to start.        // Prevents insecure deployments
+// environment (via /etc/default/irrigationd), the daemon refuses to start.       // Prevents insecure deployments
 //
 // -----------------------------------------------------------------------------
 
@@ -38,21 +38,22 @@
 #define MAX_WORKERS     32                                                         // Max concurrent worker threads
 
 // -----------------------------------------------------------------------------
-// Global shared state
+// Shared state
 // -----------------------------------------------------------------------------
-static int zone_state[MAX_ZONE+1];                                                 // zone_state[z] = 1 if ON, 0 if OFF
-static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;                      // Protects zone_state updates
-static sem_t worker_slots;                                                         // Semaphore limits concurrent workers
-static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;                   // Protects worker_list
-static pthread_t *worker_list = NULL;                                              // Dynamic list of active workers
-static size_t worker_count = 0;                                                    // Current number of workers
-static size_t worker_capacity = 0;                                                 // Capacity of worker_list array
-static const char *g_auth_token = NULL;                                            // Authentication token from env
-static int g_bind_inaddr_any = 0;                                                  // Bind address flag (0=localhost only)
+static int zone_state[MAX_ZONE+1];          // zone_state[z] = 1 if ON, 0 if OFF
+static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
+static sem_t worker_slots;
+static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t *worker_list = NULL;
+static size_t worker_count = 0;
+static size_t worker_capacity = 0;
+static const char *g_auth_token = NULL;
+static int g_bind_inaddr_any = 0;           // legacy flag (kept for compatibility)
 
 // -----------------------------------------------------------------------------
-// Utility: memory-safe allocation wrappers
+// Memory-safe allocation wrappers with centralized error handling
 // -----------------------------------------------------------------------------
+
 static void *xmalloc(size_t sz) {
     void *p = malloc(sz);
     if (!p) {
@@ -72,12 +73,13 @@ static void *xrealloc(void *old, size_t sz) {
 }
 
 // -----------------------------------------------------------------------------
-// Worker tracking (to ensure clean shutdown and prevent leaks)
+// Worker tracking (ensures we can join all threads on shutdown)
 // -----------------------------------------------------------------------------
+
 static void add_worker(pthread_t tid) {
     pthread_mutex_lock(&workers_lock);
     if (worker_count == worker_capacity) {
-        size_t newcap = worker_capacity ? worker_capacity * 2 : 8;                 // Grow exponentially
+        size_t newcap = worker_capacity ? worker_capacity * 2 : 8;
         pthread_t *newlist = xrealloc(worker_list, newcap * sizeof(pthread_t));
         worker_list = newlist;
         worker_capacity = newcap;
@@ -90,7 +92,7 @@ static void remove_worker(pthread_t tid) {
     pthread_mutex_lock(&workers_lock);
     for (size_t i = 0; i < worker_count; i++) {
         if (pthread_equal(worker_list[i], tid)) {
-            worker_list[i] = worker_list[--worker_count];                          // Replace with last element
+            worker_list[i] = worker_list[--worker_count];
             break;
         }
     }
@@ -112,8 +114,9 @@ static void join_workers_and_cleanup(void) {
 }
 
 // -----------------------------------------------------------------------------
-// Zone control helpers
+// Zone control
 // -----------------------------------------------------------------------------
+
 static void set_zone_state(int zone, int state) {
     if (zone < 1 || zone > MAX_ZONE) {
         fprintf(stderr, "set_zone_state: invalid zone %d\n", zone);
@@ -121,11 +124,11 @@ static void set_zone_state(int zone, int state) {
     }
 
     pthread_mutex_lock(&zone_lock);
-    zone_state[zone] = state;                                                      // Update logical state
+    zone_state[zone] = state;
     pthread_mutex_unlock(&zone_lock);
 
     mcp_lock();
-    mcp_set_zone_state(zone, state);                                               // Push state to MCP23017 hardware
+    mcp_set_zone_state(zone, state);
     mcp_unlock();
 
     fprintf(stderr, "Zone %d -> %s\n", zone, state ? "ON" : "OFF");
@@ -134,6 +137,7 @@ static void set_zone_state(int zone, int state) {
 // -----------------------------------------------------------------------------
 // Worker thread: executes timed zone control
 // -----------------------------------------------------------------------------
+
 struct worker_arg {
     int zone;
     int duration;
@@ -168,6 +172,8 @@ static void *worker_thread(void *arg) {
 // -----------------------------------------------------------------------------
 // Command parser
 // -----------------------------------------------------------------------------
+
+// Extract key=value pairs from the command string
 static char *get_kv(const char *cmd, const char *key) {
     size_t klen = strlen(key);
     const char *p = strstr(cmd, key);
@@ -230,6 +236,8 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
 // -----------------------------------------------------------------------------
 // Client thread handler (per connection)
 // -----------------------------------------------------------------------------
+
+// Format a client address (IPv4) into "ip:port"
 static void format_client_addr(const struct sockaddr_in *cli, char *buf, size_t sz) {
     char ip[INET_ADDRSTRLEN];
     if (!inet_ntop(AF_INET, &cli->sin_addr, ip, sizeof(ip))) {
@@ -294,12 +302,20 @@ static void *client_thread(void *arg) {
 // -----------------------------------------------------------------------------
 // Main server loop
 // -----------------------------------------------------------------------------
+
 int main(void) {
+    // Use stderr logging (systemd captures stdout/stderr)
     // Load environment configuration
     g_auth_token = getenv("IRRIGATIOND_TOKEN");
     const char *bind_env = getenv("IRRIGATIOND_BIND_ADDR");
-    if (bind_env && strcmp(bind_env, "0.0.0.0") == 0) {
-        g_bind_inaddr_any = 1;
+    struct in_addr bind_addr = {0};
+    int have_bind_addr = 0;
+    if (bind_env && bind_env[0] != '\0') {
+        if (inet_pton(AF_INET, bind_env, &bind_addr) == 1) {
+            have_bind_addr = 1;
+        } else {
+            fprintf(stderr, "Invalid IRRIGATIOND_BIND_ADDR '%s', falling back to 127.0.0.1\n", bind_env);
+        }
     }
 
     if (g_auth_token) {
@@ -328,7 +344,15 @@ int main(void) {
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(SERVER_PORT);
-    addr.sin_addr.s_addr = g_bind_inaddr_any ? INADDR_ANY : inet_addr("127.0.0.1");
+    if (have_bind_addr) {
+        addr.sin_addr = bind_addr;
+        char bstr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &addr.sin_addr, bstr, sizeof(bstr));
+        fprintf(stderr, "Binding to %s:%d\n", bstr, SERVER_PORT);
+    } else {
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        fprintf(stderr, "Binding to 127.0.0.1:%d\n", SERVER_PORT);
+    }
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "bind failed: %s\n", strerror(errno));
