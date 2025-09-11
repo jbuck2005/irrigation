@@ -33,9 +33,9 @@ static int g_fd = -1;                                                           
 static pthread_mutex_t *g_mutex = NULL;                                         // Pointer to an external mutex, enabling optional thread safety.
 static uint8_t g_debug = 0;                                                     // A flag to enable or disable verbose debug logging.
 
-/* ADDITIONAL DOC: The driver exposes mcp_lock()/mcp_unlock() as public    */
-// helpers that lock/unlock the configured mutex. Callers should wrap composite hardware+software sequences with
-// mcp_lock(); /* ... */ mcp_unlock(); to guarantee atomic behavior without risk of double-lock deadlocks.
+// The driver exposes mcp_lock()/mcp_unlock() as public helpers that lock/unlock
+// the configured mutex. Callers should wrap composite hardware+software sequences
+// with mcp_lock(); ... mcp_unlock(); to guarantee atomic behavior without risk of deadlocks.
 
 int mcp_i2c_open(const char *devnode) {
     g_fd = open(devnode, O_RDWR);                                               // Open the specified I2C device file (e.g., "/dev/i2c-1") for reading and writing.
