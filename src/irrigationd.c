@@ -9,9 +9,11 @@
 #include <arpa/inet.h>
 #include <semaphore.h>
 #include <sys/types.h>
-#include <time.h>
+#include <time.h>               // Added for nanosleep and struct timespec
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/time.h>           // Added for struct timeval and setsockopt
+#include <string.h>             // Added for strdup and strtok_r
 
 #include "mcp23017.h"
 #include "rate_limit.h"
@@ -174,7 +176,7 @@ static void *worker_thread(void *arg) {
 static ssize_t read_line(int fd, char *buf, size_t sz, int timeout_seconds) {
     if (sz == 0) return -1;
     size_t i = 0;
-    struct timeval tv;
+    struct timeval tv;  // This requires <sys/time.h>
     tv.tv_sec = timeout_seconds;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
