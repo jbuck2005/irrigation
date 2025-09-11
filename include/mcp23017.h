@@ -33,7 +33,6 @@ int mcp_set_zone_state(int zone, int state);
 // Configure MCP23017 GPIO pins as outputs (all irrigation zones)
 int mcp_config_outputs(void);
 
-
 // Read irrigation zone state (1 = ON, 0 = OFF)                                //
 int mcp_get_zone_state(int zone);
 
