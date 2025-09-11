@@ -1,31 +1,35 @@
-# irrigationd.service                                                                             // systemd unit for irrigation daemon
-#
-# This service runs irrigationd, which listens on a TCP port (default 4242)                        //
-# and drives the MCP23017-based irrigation controller.                                             //
-#
-# Usage:                                                                                          //
-#   sudo systemctl enable irrigationd.service     # Start on boot                                  //
-#   sudo systemctl start  irrigationd.service     # Start immediately                              //
-#   sudo systemctl status irrigationd.service     # Check status                                   //
-
 [Unit]
-Description=Irrigation Control Daemon (MCP23017 + TCP server)                                     
-After=network.target                                                                              
+Description=Irrigation Controller Daemon
+After=network.target
 
 [Service]
-Type=simple                                                                                      
-ExecStart=/usr/local/bin/irrigationd                                                              
-Restart=always                                                                                   
-RestartSec=5                                                                                      
-User=james                                                                                           
-Group=james                                                                                          
+Type=simple
+ExecStart=/usr/local/bin/irrigationd
+Restart=on-failure
+RestartSec=5s
 
-# Environment variables control TCP port and debug logging                                         
-Environment="IRRIGATION_PORT=4242"                                                                
-Environment="IRRIGATION_DEBUG=0"                                                                  
+# Run as a dedicated system user for safety
+User=irrigation
+Group=irrigation
 
-# Working directory (optional, but makes logs cleaner)                                             
-WorkingDirectory=/usr/local/bin                                                                   
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Environment configuration (token + bind address)
+# Create /etc/default/irrigationd with your settings:
+#   IRRIGATIOND_TOKEN=supersecret
+#   IRRIGATIOND_BIND_ADDR=0.0.0.0
+EnvironmentFile=-/etc/default/irrigationd
 
 [Install]
-WantedBy=multi-user.target                                                                        
+WantedBy=multi-user.target

@@ -1,45 +1,56 @@
 /**
  * @file mcp23017.c
- * @brief Driver for the MCP23017 I2C I/O expander for irrigation control
+ * @brief Driver for MCP23017 I2C GPIO expander
  *
- * This module provides a safe and documented interface to the MCP23017
- * 16-bit I/O expander, used in our irrigation controller to drive zone relays.
+ * Provides functions to configure MCP23017 pins as outputs and control them.
+ * Zones are mapped to pins according to a reverse mapping strategy.
  *
  * Features:
- *   - Open and configure the I²C device safely
- *   - Configure expander ports as outputs
- *   - Map logical irrigation zones (1..14) to MCP23017 GPIO pins
- *   - Set zone state ON/OFF with proper register updates
- *   - Optional thread safety via external mutex integration
- *   - Integrated syslog logging for errors, warnings, and debug output
- *
- * Design Notes:
- *   - All low-level I²C operations are wrapped in helper functions
- *   - Errors are reported both to stderr (for dev/debug) and syslog
- *   - File descriptors are marked FD_CLOEXEC to avoid leaking across exec()
- *   - If IRRIGATIOND_DEBUG is set in the environment, verbose debug logging is enabled
+ *   - Safe I2C file descriptor handling (FD_CLOEXEC)
+ *   - Optional thread-safety via external mutex
+ *   - Syslog logging for open/close and errors
+ *   - Debug logging if IRRIGATIOND_DEBUG=1 is set
  */
 
+#include "mcp23017.h"
+
 #include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
 #include <pthread.h>
 #include <syslog.h>
 
-#include "mcp23017.h"
+// MCP23017 register addresses (BANK=0)
+static const uint8_t IODIRA   = 0x00;
+static const uint8_t IODIRB   = 0x01;
+static const uint8_t OLATA    = 0x14;
+static const uint8_t OLATB    = 0x15;
 
-// --- Global State ---
-static int g_fd = -1;                                                           // File descriptor for the I2C bus; -1 indicates it's not open.
-static pthread_mutex_t *g_mutex = NULL;                                         // Pointer to an external mutex, enabling optional thread safety.
-static uint8_t g_debug = 0;                                                     // A flag to enable or disable verbose debug logging.
+static int i2c_fd = -1;
+static pthread_mutex_t *driver_lock = NULL;
 
-// Set FD_CLOEXEC on a file descriptor so it won't leak into exec'd children
+static uint8_t olat_a = 0x00;
+static uint8_t olat_b = 0x00;
+
+static int g_debug = 0;
+
+// Reverse mapping table: zone -> { bank, bit }
+static const struct { char bank; uint8_t bit; } zone_map[MAX_ZONE + 1] = {
+    {0,0},             // unused index 0
+    {'A',0}, {'A',1}, {'A',2}, {'A',3}, {'A',4}, {'A',5}, {'A',6}, {'A',7},
+    {'B',0}, {'B',1}, {'B',2}, {'B',3}, {'B',4}, {'B',5}
+};
+
+// --- Internal helpers ---
+
+static void lock_driver(void)   { if (driver_lock) pthread_mutex_lock(driver_lock); }
+static void unlock_driver(void) { if (driver_lock) pthread_mutex_unlock(driver_lock); }
+
 static void set_cloexec(int fd) {
     if (fd < 0) return;
     int flags = fcntl(fd, F_GETFD);
@@ -47,145 +58,87 @@ static void set_cloexec(int fd) {
     (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
-int mcp_i2c_open(const char *devnode) {
-    openlog("mcp23017", LOG_PID | LOG_CONS, LOG_DAEMON);                        //                                                  ADDED AT COL 81 -> Open syslog connection with tag "mcp23017"
+static int write_reg(uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = { reg, val };
+    if (write(i2c_fd, buf, 2) != 2) {
+        syslog(LOG_ERR, "i2c write reg 0x%02X failed: %s", reg, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
 
-    g_fd = open(devnode, O_RDWR);
-    if (g_fd < 0) {
-        perror("open(i2c)");
-        syslog(LOG_ERR, "Failed to open I2C bus %s: %s", devnode, strerror(errno));
+// --- Public API ---
+
+int mcp_i2c_open(const char *dev) {
+    if (!dev) return -1;
+    i2c_fd = open(dev, O_RDWR);
+    if (i2c_fd < 0) {
+        syslog(LOG_ERR, "open %s failed: %s", dev, strerror(errno));
+        return -1;
+    }
+    set_cloexec(i2c_fd);
+
+    if (ioctl(i2c_fd, I2C_SLAVE, 0x20) < 0) {
+        syslog(LOG_ERR, "ioctl I2C_SLAVE failed: %s", strerror(errno));
+        close(i2c_fd);
+        i2c_fd = -1;
         return -1;
     }
 
-    set_cloexec(g_fd);
-
-    if (ioctl(g_fd, I2C_SLAVE, MCPADDR) < 0) {
-        perror("ioctl(I2C_SLAVE)");
-        syslog(LOG_ERR, "Failed to set I2C slave address 0x%02x: %s", MCPADDR, strerror(errno));
-        close(g_fd);
-        g_fd = -1;
-        return -1;
-    }
-
-    if (getenv("IRRIGATIOND_DEBUG")) {
-        g_debug = 1;
-        syslog(LOG_INFO, "MCP23017 debug enabled via IRRIGATIOND_DEBUG");
-    }
-
+    if (getenv("IRRIGATIOND_DEBUG")) g_debug = 1;
+    syslog(LOG_INFO, "MCP23017 opened on %s", dev);
     return 0;
 }
 
 void mcp_i2c_close(void) {
-    if (g_fd >= 0) {
-        close(g_fd);
+    if (i2c_fd >= 0) {
+        close(i2c_fd);
+        syslog(LOG_INFO, "MCP23017 closed");
+        i2c_fd = -1;
     }
-    g_fd = -1;
-
-    closelog();                                                                 //                                                  ADDED AT COL 81 -> Close syslog connection when device is closed
-}
-
-void mcp_lock(void) {
-    if (g_mutex) pthread_mutex_lock(g_mutex);
-}
-
-void mcp_unlock(void) {
-    if (g_mutex) pthread_mutex_unlock(g_mutex);
-}
-
-static int mcp_write(uint8_t reg, uint8_t val) {
-    if (g_fd < 0) {
-        syslog(LOG_ERR, "mcp_write called with invalid file descriptor");
-        return -1;
-    }
-
-    uint8_t buf[2] = { reg, val };
-    ssize_t w = write(g_fd, buf, 2);
-    if (w != 2) {
-        if (w < 0) perror("mcp_write");
-        syslog(LOG_ERR, "I2C write failed to reg 0x%02x: %s", reg, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
-static int mcp_read(uint8_t reg, uint8_t *out) {
-    if (g_fd < 0) {
-        syslog(LOG_ERR, "mcp_read called with invalid file descriptor");
-        return -1;
-    }
-
-    uint8_t r = reg;
-    if (write(g_fd, &r, 1) != 1) {
-        perror("mcp_read (set addr)");
-        syslog(LOG_ERR, "I2C failed to set read address to 0x%02x: %s", reg, strerror(errno));
-        return -1;
-    }
-
-    if (read(g_fd, out, 1) != 1) {
-        perror("mcp_read (read data)");
-        syslog(LOG_ERR, "I2C read failed from reg 0x%02x: %s", reg, strerror(errno));
-        return -1;
-    }
-
-    if (g_debug) {
-        fprintf(stderr, "read[0x%02x] => 0x%02x\n", reg, *out);
-        syslog(LOG_DEBUG, "read[0x%02x] => 0x%02x", reg, *out);
-    }
-    return 0;
 }
 
 int mcp_config_outputs(void) {
-    if (mcp_write(IODIRA, 0x00)) return -1;
-    if (mcp_write(IODIRB, 0x00)) return -1;
+    if (i2c_fd < 0) return -1;
+    if (write_reg(IODIRA, 0x00) < 0) return -1;
+    if (write_reg(IODIRB, 0x00) < 0) return -1;
+    olat_a = 0x00;
+    olat_b = 0x00;
+    if (write_reg(OLATA, olat_a) < 0) return -1;
+    if (write_reg(OLATB, olat_b) < 0) return -1;
     return 0;
 }
 
-int mcp_map_zone(int zone, uint8_t *reg, uint8_t *mask) {
-    if (zone >= 1 && zone <= 8) {
-        *reg  = GPIOA;
-        *mask = (uint8_t)(1u << (zone - 1));
-        return 0;
-    } else if (zone >= 9 && zone <= 14) {
-        *reg = GPIOB;
-        static const uint8_t bmap[] = {
-            (1u << 5), (1u << 4), (1u << 3),
-            (1u << 2), (1u << 1), (1u << 0)
-        };
-        *mask = bmap[zone - 9];
-        return 0;
-    } else {
-        return -1;
-    }
-}
+int mcp_set_zone_state(int zone, int state) {
+    if (zone < 1 || zone > MAX_ZONE) return -1;
+    lock_driver();
 
-int mcp_set_zone_state(int zone, int on) {
-    uint8_t reg, mask;
-    if (mcp_map_zone(zone, &reg, &mask) != 0) {
-        fprintf(stderr, "Invalid zone: %d\n", zone);
-        syslog(LOG_ERR, "Attempted to set invalid zone: %d", zone);
-        return -1;
+    char bank = zone_map[zone].bank;
+    uint8_t bit = zone_map[zone].bit;
+    uint8_t mask = 1u << bit;
+    int rc = 0;
+
+    if (bank == 'A') {
+        if (state) olat_a |= mask;
+        else olat_a &= ~mask;
+        rc = write_reg(OLATA, olat_a);
+    } else {
+        if (state) olat_b |= mask;
+        else olat_b &= ~mask;
+        rc = write_reg(OLATB, olat_b);
     }
 
-    int rc = -1;
-    uint8_t current_val;
-    if (mcp_read(reg, &current_val) == 0) {
-        uint8_t new_val = on ? (current_val | mask) : (current_val & ~mask);
-        if (g_debug) {
-            fprintf(stderr, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)\n",
-                    zone, on ? "ON" : "OFF", current_val, new_val, reg);
-            syslog(LOG_DEBUG, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)",
-                   zone, on ? "ON" : "OFF", current_val, new_val, reg);
-        }
-        rc = mcp_write(reg, new_val);
-        if (rc != 0) {
-            syslog(LOG_ERR, "mcp_write failed during state set for zone %d", zone);
-        }
-    } else {
-        syslog(LOG_ERR, "mcp_read failed during state set for zone %d", zone);
+    if (g_debug) {
+        syslog(LOG_DEBUG, "Zone %d -> %s", zone, state ? "ON" : "OFF");
     }
+
+    unlock_driver();
     return rc;
 }
 
-void mcp_enable_thread_safety(pthread_mutex_t *external_mutex) {
-    g_mutex = external_mutex;
+void mcp_enable_thread_safety(pthread_mutex_t *lock) {
+    driver_lock = lock;
 }
+
+void mcp_lock(void)   { lock_driver(); }
+void mcp_unlock(void) { unlock_driver(); }

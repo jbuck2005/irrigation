@@ -10,6 +10,7 @@ INC_DIR  := include
 BUILD_DIR:= build
 BIN_DIR  := bin
 SYSTEMD_DIR := systemd
+EXAMPLES_DIR := examples
 
 # Programs to build
 PROGRAMS := irrigation irrigationctl irrigationd
@@ -45,14 +46,28 @@ irrigationctl: $(IRRIGATIONCTL_OBJ) | $(BIN_DIR)
 irrigationd: $(IRRIGATIOND_OBJ) | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDLIBS) -o $(BIN_DIR)/$@
 
-# Install target (optional)
+# Install target
 install: all
 	install -d $(DESTDIR)/usr/local/bin
 	install -m 755 $(BIN_DIR)/* $(DESTDIR)/usr/local/bin/
 	install -d $(DESTDIR)/etc/systemd/system
-	install -m 644 $(SYSTEMD_DIR)/*.service $(DESTDIR)/etc/systemd/system/
+	install -m 644 $(SYSTEMD_DIR)/irrigationd.service $(DESTDIR)/etc/systemd/system/
+	install -d $(DESTDIR)/etc/default
+	install -m 644 $(EXAMPLES_DIR)/irrigationd $(DESTDIR)/etc/default/irrigationd
+
+# Enable target (reload systemd, enable + start the service)
+enable:
+	systemctl daemon-reexec
+	systemctl enable --now irrigationd.service
+
+# Uninstall target
+uninstall:
+	rm -f $(DESTDIR)/usr/local/bin/irrigation
+	rm -f $(DESTDIR)/usr/local/bin/irrigationctl
+	rm -f $(DESTDIR)/usr/local/bin/irrigationd
+	rm -f $(DESTDIR)/etc/systemd/system/irrigationd.service
+	rm -f $(DESTDIR)/etc/default/irrigationd
 
 # Clean target
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
-.PHONY: all install clean
