@@ -42,6 +42,9 @@
 #define GPIOA     0x12                                                          // General Purpose I/O register for Port A (read/write pin states)
 #define GPIOB     0x13                                                          // General Purpose I/O register for Port B
 
+// --- Irrigation system logical constants ---
+#define MAX_ZONE   14                                                            // Maximum number of supported zones (1..14)
+
 // --- Function Prototypes ---
 
 /**
