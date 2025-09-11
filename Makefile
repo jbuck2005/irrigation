@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------
-# Makefile for irrigationd project
+# Makefile for irrigationd project (hardened build)
 # -------------------------------------------------------------------
 # Targets:
 #   make            -> build irrigationd daemon
@@ -13,8 +13,22 @@
 # -------------------------------------------------------------------
 
 CC      := gcc
-CFLAGS  := -Wall -Wextra -std=c11 -Iinclude
-LDFLAGS := -lpthread
+
+# Base warnings and C standard
+CFLAGS  := -Wall -Wextra -Wpedantic -std=c11 -Iinclude
+
+# Compiler hardening flags
+CFLAGS  += -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -Wformat -Wformat-security
+
+# Linker hardening flags
+LDFLAGS := -lpthread -pie -Wl,-z,relro,-z,now,-z,noexecstack
+
+# Debug vs release
+ifeq ($(DEBUG),1)
+  CFLAGS  += -g -O0
+else
+  CFLAGS  += -O2
+endif
 
 SRC_DIR := src
 INC_DIR := include
@@ -36,21 +50,14 @@ TEST_RL_OBJS   := $(TEST_RL_SRCS:.c=.o)
 DAEMON_BIN := irrigationd
 TEST_BINS  := test_auth test_rate_limit
 
-# Debug mode
-ifeq ($(DEBUG),1)
-  CFLAGS += -g -O0
-else
-  CFLAGS += -O2
-endif
-
 # Installation paths
 PREFIX      ?= /usr/local
 BINDIR      := $(PREFIX)/bin
 SYSTEMD_DIR ?= /etc/systemd/system
 DEFAULTS_DIR?= /etc/default
 
-SERVICE_FILE := systemd/irrigationd.service
-DEFAULTS_FILE := examples/irrigationd.defaults
+SERVICE_FILE := irrigationd.service
+DEFAULTS_FILE:= examples/irrigationd.defaults
 
 # -------------------------------------------------------------------
 # Default target
@@ -101,10 +108,9 @@ install: $(DAEMON_BIN)
 	# Install /etc/default/irrigationd if not present
 	install -d $(DESTDIR)$(DEFAULTS_DIR)
 	if [ ! -f $(DESTDIR)$(DEFAULTS_DIR)/irrigationd ]; then \
-	install -m 0640 $(DEFAULTS_FILE) $(DESTDIR)$(DEFAULTS_DIR)/irrigationd; \
+	  install -m 0640 $(DEFAULTS_FILE) $(DESTDIR)$(DEFAULTS_DIR)/irrigationd; \
 	fi
 	chown root:irrigationd $(DESTDIR)$(DEFAULTS_DIR)/irrigationd
-	chmod 0640 $(DESTDIR)$(DEFAULTS_DIR)/irrigationd
 
 	@echo "Install complete."
 	@echo "Run the following to enable service:"

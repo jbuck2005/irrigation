@@ -9,6 +9,8 @@
 #include <errno.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 // -----------------------------------------------------------------------------
 // MCP23017 Register Map (BANK=0 mode)
@@ -30,7 +32,8 @@
 //                                                                                 The driver uses an internal mutex fallback if the caller does not
 //                                                                                 supply one via mcp_enable_thread_safety(). This ensures calls are
 //                                                                                 safe in typical multi-threaded programs that forget to set their
-//                                                                                 own lock.
+//                                                                                 own lock. All driver-visible state (i2c_fd, olat caches) must be
+//                                                                                 accessed while holding the driver lock to avoid races.
 static int i2c_fd = -1;                  // File descriptor for /dev/i2c-X
 static pthread_mutex_t internal_lock = PTHREAD_MUTEX_INITIALIZER; // fallback lock
 static pthread_mutex_t *driver_lock = NULL; // Optional external lock
@@ -53,7 +56,18 @@ void mcp_unlock(void) {
 // -----------------------------------------------------------------------------
 // Low-level I²C helpers
 // -----------------------------------------------------------------------------
+// These helpers DO NOT manipulate driver_lock; the callers must hold the
+// driver lock before invoking them.
+//
+//                 (verbose documentation starts at column 81)
+//                                                                                 i2c_write_reg and i2c_read_reg assume the driver lock is held. This
+//                                                                                 keeps low-level operations fast and allows callers to group multi-
+//                                                                                 register operations under a single lock.
 static int i2c_write_reg(uint8_t reg, uint8_t val) {
+    if (i2c_fd < 0) {
+        fprintf(stderr, "i2c_write_reg: device not open\n");
+        return -1;
+    }
     uint8_t buf[2] = { reg, val };
     ssize_t r = write(i2c_fd, buf, 2);
     if (r != 2) {
@@ -64,10 +78,13 @@ static int i2c_write_reg(uint8_t reg, uint8_t val) {
 }
 
 static int i2c_read_reg(uint8_t reg, uint8_t *val) {
-    // Write the register address, then read one byte. Some i2c adapters
-    // provide this behavior with a repeated start automatically.
-    ssize_t r;
-    r = write(i2c_fd, &reg, 1);
+    if (i2c_fd < 0) {
+        fprintf(stderr, "i2c_read_reg: device not open\n");
+        return -1;
+    }
+
+    // write register address
+    ssize_t r = write(i2c_fd, &reg, 1);
     if (r != 1) {
         fprintf(stderr, "i2c_read_reg: select reg=0x%02x failed: %s\n", reg, strerror(errno));
         return -1;
@@ -94,38 +111,44 @@ static int i2c_read_reg(uint8_t reg, uint8_t *val) {
 int mcp_i2c_open(const char *dev) {
     if (!dev) return -1;
 
-    i2c_fd = open(dev, O_RDWR);
-    if (i2c_fd < 0) {
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) {
         fprintf(stderr, "mcp_i2c_open: failed to open %s: %s\n", dev, strerror(errno));
         return -1;
     }
 
     // set close-on-exec
-    int flags = fcntl(i2c_fd, F_GETFD);
-    if (flags >= 0) fcntl(i2c_fd, F_SETFD, flags | FD_CLOEXEC);
+    int flags = fcntl(fd, F_GETFD);
+    if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 
-    if (ioctl(i2c_fd, I2C_SLAVE, 0x20) < 0) { // MCP23017 default address
+    if (ioctl(fd, I2C_SLAVE, 0x20) < 0) { // MCP23017 default address
         fprintf(stderr, "mcp_i2c_open: failed to set slave 0x20: %s\n", strerror(errno));
-        close(i2c_fd);
-        i2c_fd = -1;
+        close(fd);
         return -1;
     }
 
-    // Configure all 16 pins as outputs and initialize outputs to OFF
+    // assign under lock to avoid races with concurrent close/open
+    mcp_lock();
+    i2c_fd = fd;
+    // configure outputs and clear OLATs
     if (mcp_config_outputs() < 0) {
         close(i2c_fd);
         i2c_fd = -1;
+        mcp_unlock();
         return -1;
     }
+    mcp_unlock();
 
     return 0;
 }
 
 void mcp_i2c_close(void) {
+    mcp_lock();
     if (i2c_fd >= 0) {
         close(i2c_fd);
         i2c_fd = -1;
     }
+    mcp_unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -133,6 +156,12 @@ void mcp_i2c_close(void) {
 // -----------------------------------------------------------------------------
 // Allow callers to provide their own mutex for call serialization. If they do
 // not, the driver uses internal_lock as a safe fallback.
+//
+//                 (verbose documentation starts at column 81)
+//                                                                                 If you supply an external mutex via mcp_enable_thread_safety(), the
+//                                                                                 caller must ensure it follows the documented lock ordering: DO NOT
+//                                                                                 hold other unrelated locks while calling driver functions unless you
+//                                                                                 are certain the same order is used everywhere to avoid deadlocks.
 void mcp_enable_thread_safety(pthread_mutex_t *lock) {
     driver_lock = lock;
 }
@@ -141,8 +170,6 @@ void mcp_enable_thread_safety(pthread_mutex_t *lock) {
 // Zone mapping helpers
 // -----------------------------------------------------------------------------
 // Convert a 1-based zone number into port (A/B) and bit mask.
-//
-
 static int zone_to_pin(int zone, uint8_t *is_b, uint8_t *mask) {
     if (zone < 1 || zone > MAX_ZONE) return -1;
     int pin = zone - 1;                      // zone 1 = pin 0
@@ -183,7 +210,9 @@ int mcp_get_zone_state(int zone) {
     if (zone_to_pin(zone, &is_b, &mask) < 0) return -1;
 
     uint8_t val = 0;
+    mcp_lock();
     int rc = i2c_read_reg(is_b ? MCP23017_GPIOB : MCP23017_GPIOA, &val);
+    mcp_unlock();
     if (rc < 0) return -1;
 
     return (val & mask) ? 1 : 0;
@@ -192,16 +221,6 @@ int mcp_get_zone_state(int zone) {
 // -----------------------------------------------------------------------------
 // mcp_config_outputs - ensure all pins are outputs and clear OLATs
 // -----------------------------------------------------------------------------
-// Some callers expect an explicit function to (re)configure pins as outputs.
-// Implemented to allow reconfiguration and to keep the initialization step
-// explicit.
-//
-//                 (verbose documentation starts at column 81)
-//                                                                                 This helper programs the IODIR registers to mark all 16 GPIOs as
-//                                                                                 outputs (IODIRx = 0x00) and writes the OLAT registers to set all
-//                                                                                 outputs low. The cached olat_a/olat_b variables are updated to
-//                                                                                 reflect the device state. The function performs register writes
-//                                                                                 under lock to avoid concurrent access issues.
 int mcp_config_outputs(void) {
     if (i2c_fd < 0) {
         fprintf(stderr, "mcp_config_outputs: i2c device not open\n");
