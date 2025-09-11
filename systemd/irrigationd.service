@@ -26,10 +26,8 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 
 # Environment configuration (token + bind address)
-# Create /etc/default/irrigationd with your settings:
-#   IRRIGATIOND_TOKEN=supersecret
-#   IRRIGATIOND_BIND_ADDR=0.0.0.0
-EnvironmentFile=-/etc/default/irrigationd
+# This file is REQUIRED. Service will fail if missing.
+EnvironmentFile=/etc/default/irrigationd
 
 [Install]
 WantedBy=multi-user.target

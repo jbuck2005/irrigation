@@ -53,7 +53,12 @@ install: all
 	install -d $(DESTDIR)/etc/systemd/system
 	install -m 644 $(SYSTEMD_DIR)/irrigationd.service $(DESTDIR)/etc/systemd/system/
 	install -d $(DESTDIR)/etc/default
-	install -m 644 $(EXAMPLES_DIR)/irrigationd $(DESTDIR)/etc/default/irrigationd
+	@if [ ! -f $(DESTDIR)/etc/default/irrigationd ]; then \
+		install -m 644 $(EXAMPLES_DIR)/irrigationd $(DESTDIR)/etc/default/irrigationd; \
+		echo "Installed default /etc/default/irrigationd"; \
+	else \
+		echo "Skipping /etc/default/irrigationd (already exists)"; \
+	fi
 
 # Enable target (reload systemd, enable + start the service)
 enable:
