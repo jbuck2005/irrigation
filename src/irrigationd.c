@@ -1,3 +1,6 @@
+// Define POSIX source for clock_gettime and CLOCK_MONOTONIC
+#define _POSIX_C_SOURCE 199309L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,11 +12,11 @@
 #include <arpa/inet.h>
 #include <semaphore.h>
 #include <sys/types.h>
-#include <time.h>               // Added for nanosleep and struct timespec
+#include <time.h>               // For nanosleep and struct timespec
 #include <fcntl.h>
 #include <signal.h>
-#include <sys/time.h>           // Added for struct timeval and setsockopt
-#include <string.h>             // Added for strdup and strtok_r
+#include <sys/time.h>           // For struct timeval and setsockopt
+#include <string.h>             // For strdup and strtok_r
 
 #include "mcp23017.h"
 #include "rate_limit.h"
