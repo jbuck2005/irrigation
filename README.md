@@ -1,119 +1,115 @@
 # Irrigation Controller
 
-This project provides a simple irrigation controller for Raspberry Pi using the **MCP23017 I²C GPIO expander**.  
-It includes a daemon service, command-line utilities, and systemd integration so it can run automatically on boot.
+This project provides a simple, secure irrigation control system based on a
+Raspberry Pi and an MCP23017 I²C GPIO expander.
 
-## Features
-- Control irrigation zones via **MCP23017** I²C GPIO expander.
-- Daemon (`irrigationd`) that listens for commands.
-- CLI utilities:
-  - `irrigation` — manual zone control
-  - `irrigationctl` — send commands to the daemon
-- `systemd` unit for automatic start & management.
+It consists of three main components:
 
-## Quick start
+1. **irrigationd** – the daemon (background service) that listens for commands
+   over TCP and controls irrigation zones via the MCP23017.
+2. **irrigationctl** – a lightweight CLI tool to send commands to the daemon.
+3. **Home Assistant integration** – Python code that allows zones to be managed
+   from Home Assistant as switches.
 
-### Prerequisites
-- Linux (tested on Raspberry Pi OS)
-- GCC and build tools:
+---
+
+## 🔧 Build and Install
+
 ```bash
-sudo apt-get update
-sudo apt-get install build-essential i2c-tools
-```
-- I²C enabled on your Raspberry Pi (use `raspi-config` or enable via `/boot/config.txt`).
-
-### Build
-Clone the repository and build:
-```bash
-git clone https://github.com/YOURNAME/irrigation.git
-cd irrigation
 make
-```
-Binaries are created in the `bin/` directory:
-```
-bin/irrigation
-bin/irrigationctl
-bin/irrigationd
+sudo make install
 ```
 
-### Install
-Install binaries system-wide and install the `systemd` unit:
+This installs:
+
+- `/usr/local/bin/irrigationd` – the daemon
+- `/usr/local/bin/irrigationctl` – the CLI tool
+- `/etc/systemd/system/irrigationd.service` – systemd unit
+- `/etc/default/irrigationd` – configuration file (token and bind address)
+
+---
+
+## ⚙️ Configuration
+
+Edit `/etc/default/irrigationd`:
+
 ```bash
-sudo make install
+IRRIGATIOND_TOKEN=changeme-very-secret-token
+IRRIGATIOND_BIND_ADDR=127.0.0.1
+```
+
+- **IRRIGATIOND_TOKEN** – required token for all commands.
+- **IRRIGATIOND_BIND_ADDR** – set to `127.0.0.1` (default) to only accept local
+  connections, or `0.0.0.0` to allow remote access.
+
+Reload systemd and enable the service:
+
+```bash
+sudo systemctl daemon-reload
 sudo systemctl enable irrigationd
 sudo systemctl start irrigationd
 ```
 
-## Usage
+Check logs:
 
-Run the daemon manually (for testing):
 ```bash
-irrigationd
+sudo journalctl -u irrigationd -f
 ```
 
-Control a zone directly:
+---
+
+## 🖥️ Usage
+
+### CLI Tool
+
+Turn on zone 1 for 30 seconds:
+
 ```bash
-irrigation ZONE=1 TIME=30
+irrigationctl "ZONE=1 TIME=30 TOKEN=changeme-very-secret-token"
 ```
 
-Send a command to the running daemon:
+Turn off zone 1:
+
 ```bash
-irrigationctl ZONE=1 TIME=30
+irrigationctl "ZONE=1 TIME=0 TOKEN=changeme-very-secret-token"
 ```
 
-### Example
-Start irrigation on zone 2 for 5 minutes:
+### Netcat (debugging)
+
 ```bash
-irrigationctl ZONE=2 TIME=5
+echo "ZONE=1 TIME=10 TOKEN=changeme-very-secret-token" | nc 127.0.0.1 4242
 ```
 
-## Project layout
-```
-.
-├── include/        # Header files (mcp23017.h)
-├── src/            # Source files (irrigation.c, irrigationctl.c, irrigationd.c, mcp23017.c)
-├── systemd/        # Systemd service unit (irrigationd.service)
-├── scripts/        # Helper scripts (diagnostics.sh)
-├── examples/       # Usage examples (examples.txt)
-├── Makefile        # Build system
-└── README.md       # This file
+---
+
+## 🏠 Home Assistant Integration
+
+A custom integration is provided under `custom_components/irrigation/`. Copy
+this directory into your Home Assistant `custom_components` folder.
+
+Update your `configuration.yaml`:
+
+```yaml
+switch:
+  - platform: irrigation
+    host: 127.0.0.1
+    port: 4242
+    token: changeme-very-secret-token
+    zones:
+      - 1
+      - 2
+      - 3
 ```
 
-## Systemd management
-Check status:
-```bash
-systemctl status irrigationd
-```
-Stop / restart:
-```bash
-sudo systemctl stop irrigationd
-sudo systemctl restart irrigationd
-```
-View logs:
-```bash
-journalctl -u irrigationd -f
-```
+Restart Home Assistant. Each zone will appear as a switch.
 
-## Development & maintenance
-Clean build artifacts:
-```bash
-make clean
-```
+---
 
-Uninstall installed files:
-```bash
-sudo make uninstall
-```
+## 🔒 Security Notes
 
-If you modify headers in `include/` or sources in `src/`, re-run `make`.
-
-## Contributing
-Contributions are welcome. When opening a PR, please:
-- Make small, focused changes.
-- Include a short description and testing steps.
-- Update this README if you change user-facing behavior.
-
-## License
-This project is intended to be released under the MIT License.
+- Always configure a strong `IRRIGATIOND_TOKEN`.
+- Keep `IRRIGATIOND_BIND_ADDR=127.0.0.1` unless you explicitly need remote access.
+- Use a firewall if exposing the service beyond localhost.
+- Home Assistant integration must be configured with the same token.
 
 ---
