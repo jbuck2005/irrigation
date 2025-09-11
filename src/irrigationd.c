@@ -441,6 +441,13 @@ int main(void) {
         g_bind_inaddr_any = 1;
     }
 
+    if (g_auth_token) {
+        syslog(LOG_INFO, "Token enforcement enabled (IRRIGATIOND_TOKEN is set)");
+    } else {
+        syslog(LOG_ERR, "IRRIGATIOND_TOKEN is not set, refusing to start insecure");
+        exit(EXIT_FAILURE);
+    }
+
     if (pipe(sigpipe_fd) == 0) {
         set_cloexec(sigpipe_fd[0]);
         set_cloexec(sigpipe_fd[1]);
