@@ -211,6 +211,16 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
         return -1;
     }
 
+    // Special case: TIME=0 → turn OFF immediately, no worker
+    if (duration == 0) {
+        set_zone_state(zone, 0);
+        const char ok[] = "OK\n";
+        write(cfd, ok, sizeof(ok) - 1);
+        fprintf(stderr, "[%s] Zone %d OFF (immediate stop)\n", addrbuf, zone);
+        return 0;
+    }
+
+    // Normal timed run
     struct worker_arg *wa = xmalloc(sizeof(struct worker_arg));
     wa->zone = zone;
     wa->duration = duration;
