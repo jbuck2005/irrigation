@@ -1,5 +1,4 @@
-// Change 1: Update the POSIX source version to guarantee strdup is available.
-#define _POSIX_C_SOURCE 200809L
+#define _POSIX_C_SOURCE 199309L  // Ensure POSIX functions are available
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +16,11 @@
 #include <signal.h>
 #include <sys/time.h>           // For struct timeval and setsockopt
 #include <string.h>             // For strdup and strtok_r
+
+// Fallback for strdup if it's not available
+#ifndef strdup
+#define strdup(s) ({ size_t len = strlen(s) + 1; char *dup = malloc(len); if (dup) memcpy(dup, s, len); dup; })
+#endif
 
 #include "mcp23017.h"
 #include "rate_limit.h"
@@ -174,6 +178,16 @@ static void *worker_thread(void *arg) {
 }
 
 // -----------------------------------------------------------------------------
+// Safe write function that checks write() return value
+// -----------------------------------------------------------------------------
+static void safe_write(int cfd, const char *msg, size_t len) {
+    ssize_t ret = write(cfd, msg, len);
+    if (ret == -1) {
+        perror("write failed");
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Safe read-line (bounded, newline-terminated)
 // -----------------------------------------------------------------------------
 static ssize_t read_line(int fd, char *buf, size_t sz, int timeout_seconds) {
@@ -209,44 +223,42 @@ static ssize_t read_line(int fd, char *buf, size_t sz, int timeout_seconds) {
 // Command parsing
 // -----------------------------------------------------------------------------
 static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
-    char zone_s[32]={0}, time_s[32]={0}, token_s[TOKEN_MAX_SZ]={0};
-    int have_zone=0, have_time=0, have_token=0;
+    char zone_s[32] = {0}, time_s[32] = {0}, token_s[TOKEN_MAX_SZ] = {0};
+    int have_zone = 0, have_time = 0, have_token = 0;
 
     // copy safely and ensure NUL termination
     char buf[CMD_BUF_SZ];
+    memset(buf, 0, sizeof(buf));
+    strlcpy(buf, cmd, sizeof(buf));
 
-    // Change 2: Replace strncpy block with a single, safer snprintf call.
-    snprintf(buf, sizeof(buf), "%s", cmd);
-
-    char *saveptr=NULL, *tok=strtok_r(buf, " \t\r\n", &saveptr);
+    char *saveptr = NULL, *tok = strtok_r(buf, " \t\r\n", &saveptr);
     while (tok) {
-        char *eq=strchr(tok,'=');
+        char *eq = strchr(tok, '=');
         if (eq) {
-            *eq='\0';
-            char *key=tok;
-            char *val=eq+1;
-            if (!strcmp(key,"ZONE")) { strncpy(zone_s,val,sizeof(zone_s)-1); have_zone=1; }
-            else if (!strcmp(key,"TIME")) { strncpy(time_s,val,sizeof(time_s)-1); have_time=1; }
-            else if (!strcmp(key,"TOKEN")) { strncpy(token_s,val,sizeof(token_s)-1); have_token=1; }
+            *eq = '\0';
+            char *key = tok;
+            char *val = eq + 1;
+            if (!strcmp(key, "ZONE")) { strncpy(zone_s, val, sizeof(zone_s) - 1); have_zone = 1; }
+            else if (!strcmp(key, "TIME")) { strncpy(time_s, val, sizeof(time_s) - 1); have_time = 1; }
+            else if (!strcmp(key, "TOKEN")) { strncpy(token_s, val, sizeof(token_s) - 1); have_token = 1; }
         }
-        tok=strtok_r(NULL," \t\r\n",&saveptr);
+        tok = strtok_r(NULL, " \t\r\n", &saveptr);
     }
-    
-    // Change 3: Cast all `write` calls to (void) to silence warnings.
-    if (!have_zone||!have_time||!have_token) {
-        (void)write(cfd,"ERR missing fields\n",19);
+
+    if (!have_zone || !have_time || !have_token) {
+        safe_write(cfd, "ERR missing fields\n", 19);
         return -1;
     }
 
     // Trim token_s just in case
     size_t tlen = strlen(token_s);
-    while (tlen > 0 && (token_s[tlen-1] == '\r' || token_s[tlen-1] == '\n')) token_s[--tlen] = '\0';
+    while (tlen > 0 && (token_s[tlen - 1] == '\r' || token_s[tlen - 1] == '\n')) token_s[--tlen] = '\0';
 
     if (!safe_str_equals(token_s, g_auth_token)) {
         char redacted[128];
         sanitize_cmd_for_log(cmd, redacted, sizeof(redacted));
         fprintf(stderr, "[%s] rejected (bad token): %s\n", addrbuf, redacted);
-        (void)write(cfd,"ERR auth required\n",18);
+        safe_write(cfd, "ERR auth required\n", 18);
         return -1;
     }
 
@@ -255,30 +267,30 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
     errno = 0;
     long z = strtol(zone_s, &endptr, 10);
     if (endptr == zone_s || errno != 0) {
-        (void)write(cfd,"ERR invalid ZONE\n",17);
+        safe_write(cfd, "ERR invalid ZONE\n", 17);
         return -1;
     }
     errno = 0;
     long t = strtol(time_s, &endptr, 10);
     if (endptr == time_s || errno != 0) {
-        (void)write(cfd,"ERR invalid TIME\n",17);
+        safe_write(cfd, "ERR invalid TIME\n", 17);
         return -1;
     }
 
     if (z < 1 || z > MAX_ZONE || t < 0 || t > 86400) {
-        (void)write(cfd,"ERR invalid\n",12);
+        safe_write(cfd, "ERR invalid\n", 12);
         return -1;
     }
 
     if (t == 0) {
         set_zone_state(addrbuf, (int)z, 0);
-        (void)write(cfd, "OK\n", 3);
+        safe_write(cfd, "OK\n", 3);
         return 0;
     }
 
     // Acquire worker slot (non-blocking)
     if (sem_trywait(&worker_slots) != 0) {
-        (void)write(cfd,"ERR busy\n",9);
+        safe_write(cfd, "ERR busy\n", 9);
         return -1;
     }
 
@@ -291,11 +303,11 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
     if (pthread_create(&tid, NULL, worker_thread, wa) != 0) {
         free(wa);
         sem_post(&worker_slots);
-        (void)write(cfd, "ERR thread\n", 11);
+        safe_write(cfd, "ERR thread\n", 11);
         return -1;
     }
     add_worker(tid);
-    (void)write(cfd, "OK\n", 3);
+    safe_write(cfd, "OK\n", 3);
 
     char redacted[128];
     sanitize_cmd_for_log(cmd, redacted, sizeof(redacted));
@@ -322,8 +334,7 @@ static void *client_thread(void *arg) {
     if (n > 0) {
         parse_command(cfd, buf, addrbuf);
     } else if (n == -2) {
-        // timeout
-        (void)write(cfd, "ERR timeout\n", 12);
+        safe_write(cfd, "ERR timeout\n", 12);
     } else if (n < 0) {
         fprintf(stderr, "[%s] read from client failed: %s\n", addrbuf, strerror(errno));
     }
@@ -394,7 +405,7 @@ int main(void) {
 
         uint32_t ip = ntohl(cli.sin_addr.s_addr);
         if (!rl_check_and_consume(ip)) {
-            (void)write(cfd, "ERR rate limit\n", 15);
+            safe_write(cfd, "ERR rate limit\n", 15);
             close(cfd);
             continue;
         }
