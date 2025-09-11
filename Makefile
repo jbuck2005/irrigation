@@ -50,12 +50,14 @@ clean:
 
 # Install binaries and systemd unit
 install: all
+	service irrigationd stop
 	install -d /usr/local/bin
 	install -m 755 $(BIN_DIR)/irrigation /usr/local/bin/
 	install -m 755 $(BIN_DIR)/irrigationctl /usr/local/bin/
 	install -m 755 $(BIN_DIR)/irrigationd /usr/local/bin/
 	install -d /etc/systemd/system
 	install -m 644 $(SYSTEMD_DIR)/irrigationd.service /etc/systemd/system/
+	systemctl daemon-reload
 
 # Uninstall everything
 uninstall:
