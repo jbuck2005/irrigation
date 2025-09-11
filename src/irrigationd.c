@@ -47,6 +47,7 @@
 #include <signal.h>
 #include <time.h>
 #include <syslog.h>
+#include <sys/time.h>                                                           // for struct timeval used with SO_RCVTIMEO
 #include <semaphore.h>
 #include <poll.h>
 
