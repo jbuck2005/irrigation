@@ -9,6 +9,7 @@
 #include <stdio.h>                                                                                // printf, fprintf
 #include <stdlib.h>                                                                               // atoi, EXIT_FAILURE
 #include "mcp23017.h"                                                                             // Shared MCP helpers
+#include <stdint.h>                                                                               // for uint8_t
 
 static uint8_t debug = 0;                                                                         // Local debug flag
 
