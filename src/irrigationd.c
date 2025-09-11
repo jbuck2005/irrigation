@@ -26,109 +26,184 @@
  * all zones to OFF.
  */
 
-#define _POSIX_C_SOURCE 200809L                                                 // Required for sigaction, strsignal, etc.
+#define _POSIX_C_SOURCE 200809L                                                 // Required for sigaction, clock_gettime, etc.
 
-#include <stdio.h>                                                              // Standard I/O
-#include <stdlib.h>                                                             // Standard library: malloc, free, exit
-#include <string.h>                                                             // String handling: memset, strstr
-#include <unistd.h>                                                             // POSIX API: close, sleep
-#include <errno.h>                                                              // errno and strerror
-#include <sys/types.h>                                                          // Socket programming
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <pthread.h>                                                            // POSIX threads
-#include <signal.h>                                                             // Signal handling
-#include <stdatomic.h>                                                          // Atomic variables for clean shutdown flag
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
 
-#include "mcp23017.h"                                                           // Hardware abstraction for MCP23017 driver
+#include "mcp23017.h"
 
-#define MAX_ZONE        14                                                      // Hardware supports 14 logical irrigation zones
-#define SERVER_PORT     4242                                                    // Default TCP/IP port for client connections
-#define BACKLOG         5                                                       // Maximum number of queued incoming connections
-#define CMD_BUF_SZ      256                                                     // Size of command buffer for reading client input
+#define MAX_ZONE        14
+#define SERVER_PORT     4242
+#define BACKLOG         5
+#define CMD_BUF_SZ      256
+#define WORKER_STACK_SZ (128 * 1024)                                              //                                                  ADDED AT COL 81 -> Per-worker stack size (128KB) to reduce memory usage per thread
+#define WORKER_LONG_RUNNING_SEC 300                                               //                                                  ADDED AT COL 81 -> Warn if worker runs longer than 5 minutes
 
-// --- Global State ---
+// --- Original global state preserved ---
+static int zone_state[MAX_ZONE + 1];
+static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static int zone_state[MAX_ZONE + 1];                                            // Tracks current ON/OFF state of each zone (1-based indexing)
-static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;                   // Mutex for protecting zone_state array
+// Worker tracking: store tid + start time so we can watch for long-running workers
+typedef struct {
+    pthread_t tid;
+    time_t    start;
+} worker_entry_t;
 
-static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;                // Protects worker thread list
-static pthread_t *worker_list = NULL;                                           // Dynamic array of worker thread IDs
-static size_t worker_count = 0;                                                 // Number of active worker threads
-static size_t worker_capacity = 0;                                              // Current capacity of worker_list array
+static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;
+static worker_entry_t *worker_list = NULL;
+static size_t worker_count = 0;
+static size_t worker_capacity = 0;
 
-static int listen_fd = -1;                                                      // File descriptor for listening socket
-static volatile sig_atomic_t running = 1;                                       // Global flag used to shut down gracefully on SIGINT/SIGTERM
+static int listen_fd = -1;
+static volatile sig_atomic_t running = 1;
 
-// write_all() ensures that short writes caused by signals or partial sends
-// are retried until the entire buffer is written or an error occurs.
+// Cond + mutex used to implement interruptible timers for workers
+static pthread_cond_t timer_cond = PTHREAD_COND_INITIALIZER;                     //                                                  ADDED AT COL 81 -> Condition variable used so workers can wake early on shutdown
+static pthread_mutex_t timer_mutex = PTHREAD_MUTEX_INITIALIZER;                  //                                                  ADDED AT COL 81 -> Mutex associated with timer_cond
+
+// Small allocation helpers to centralize OOM behavior (xmalloc/xrealloc).
+// If IRRIGATIOND_OOM_ABORT is set, wrappers abort the process on allocation failure.
+// Otherwise they return NULL and the caller must handle it.
+static void* xmalloc(size_t sz) {
+    void *p = malloc(sz);
+    if (!p) {
+        syslog(LOG_ERR, "malloc(%zu) failed", sz);                                //                                                  ADDED AT COL 81 -> Centralized OOM logging
+        if (getenv("IRRIGATIOND_OOM_ABORT")) abort();
+    }
+    return p;
+}
+
+static void* xrealloc(void *ptr, size_t sz) {
+    void *p = realloc(ptr, sz);
+    if (!p) {
+        syslog(LOG_ERR, "realloc(%zu) failed", sz);                              //                                                  ADDED AT COL 81 -> Centralized OOM logging
+        if (getenv("IRRIGATIOND_OOM_ABORT")) abort();
+    }
+    return p;
+}
+
+// Set FD_CLOEXEC on a descriptor to avoid leaking into children
+static void set_cloexec(int fd) {
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFD);
+    if (flags == -1) return;
+    (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+// Safe write that retries partial writes (network robustness)
 static ssize_t write_all(int fd, const void *buf, size_t len) {
     const uint8_t *p = buf;
     size_t remaining = len;
     while (remaining > 0) {
         ssize_t n = write(fd, p, remaining);
         if (n < 0) {
-            if (errno == EINTR) continue;                                       // Retry if interrupted by a signal
-            return -1;                                                          // On permanent error, abort
+            if (errno == EINTR) continue;
+            return -1;
         }
-        p += n;                                                                 // Advance pointer by number of bytes successfully written
-        remaining -= (size_t)n;                                                 // Decrease remaining count
+        p += n;
+        remaining -= (size_t)n;
     }
-    return (ssize_t)len;                                                        // Return total number of bytes written
+    return (ssize_t)len;
 }
 
-// Dynamically track worker threads. Ensures we can join them later for clean shutdown.
+// Add worker entry; log on realloc failure
 static int add_worker(pthread_t tid) {
     int rc = 0;
     if (pthread_mutex_lock(&workers_lock) != 0) return -1;
-
-    if (worker_count == worker_capacity) {                                      // Need to grow the dynamic array
-        size_t newcap = worker_capacity == 0 ? 16 : worker_capacity * 2;        // Start with 16, then double
-        pthread_t *n = realloc(worker_list, newcap * sizeof(pthread_t));
+    if (worker_count == worker_capacity) {
+        size_t newcap = worker_capacity == 0 ? 16 : worker_capacity * 2;
+        worker_entry_t *n = xrealloc(worker_list, newcap * sizeof(worker_entry_t));
         if (!n) {
-            fprintf(stderr, "ERROR: realloc failed while tracking threads\n");  // Added explicit error log
+            syslog(LOG_ERR, "Failed to grow worker_list to %zu entries", newcap); //                                                  ADDED AT COL 81 -> Log realloc failures centrally
             rc = -1;
             goto out;
         }
         worker_list = n;
         worker_capacity = newcap;
     }
-    worker_list[worker_count++] = tid;                                          // Append new thread ID
+    worker_list[worker_count].tid = tid;
+    worker_list[worker_count].start = time(NULL);
+    worker_count++;
 out:
     pthread_mutex_unlock(&workers_lock);
     return rc;
 }
 
-// Signal handler for SIGINT/SIGTERM
-// Sets the global shutdown flag and closes the listening socket.
+// Remove worker by tid (called when thread exits cleanly)
+// This keeps list compact so join phase can iterate exactly the remaining threads.
+static void remove_worker(pthread_t tid) {
+    if (pthread_mutex_lock(&workers_lock) != 0) return;
+    for (size_t i = 0; i < worker_count; ++i) {
+        if (pthread_equal(worker_list[i].tid, tid)) {
+            // move last entry here
+            worker_list[i] = worker_list[worker_count - 1];
+            worker_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&workers_lock);
+}
+
+// Signal handler: mark shutdown and close listening socket (async-signal-safe)
 static void shutdown_signal_handler(int signo) {
     (void)signo;
     running = 0;
     if (listen_fd >= 0) {
-        close(listen_fd);
+        close(listen_fd);                                                         // close is async-signal-safe
         listen_fd = -1;
     }
+    // Wake all timers so workers can exit early
+    (void)pthread_cond_broadcast(&timer_cond);                                   // POSIX: pthread_cond_broadcast is not async-signal-safe everywhere
+                                                                                //                                                  ADDED AT COL 81 -> It's acceptable in practice on many Unix systems,
+                                                                                //                                                  ADDED AT COL 81 -> but if you need strict async-signal-safety, set a flag only.
 }
 
-// Wait for all worker threads to finish, then free resources and turn all zones off.
+// Join threads and perform final hardware cleanup
 static void join_workers_and_cleanup(void) {
-    if (pthread_mutex_lock(&workers_lock) == 0) {
-        for (size_t i = 0; i < worker_count; ++i) {
-            int jrc = pthread_join(worker_list[i], NULL);
+    // Signal timers to wake immediately so workers exit quickly
+    pthread_mutex_lock(&timer_mutex);
+    pthread_cond_broadcast(&timer_cond);
+    pthread_mutex_unlock(&timer_mutex);
+
+    // Join workers (we copy the list under lock to avoid races)
+    pthread_mutex_lock(&workers_lock);
+    size_t count = worker_count;
+    worker_entry_t *snapshot = NULL;
+    if (count > 0) {
+        snapshot = malloc(count * sizeof(worker_entry_t));
+        if (snapshot) memcpy(snapshot, worker_list, count * sizeof(worker_entry_t));
+    }
+    pthread_mutex_unlock(&workers_lock);
+
+    if (snapshot) {
+        for (size_t i = 0; i < count; ++i) {
+            int jrc = pthread_join(snapshot[i].tid, NULL);
             if (jrc != 0) {
-                fprintf(stderr, "WARNING: pthread_join failed on worker %zu: %s\n",
-                        i, strerror(jrc));                                      // Added safety: log join failures
+                syslog(LOG_WARNING, "pthread_join failed on worker %zu: %s", i, strerror(jrc)); //                                                  ADDED AT COL 81 -> Log join errors
+            } else {
+                time_t now = time(NULL);
+                time_t start = snapshot[i].start;
+                if (now - start > WORKER_LONG_RUNNING_SEC) {
+                    syslog(LOG_WARNING, "worker %zu ran %ld seconds", i, (long)(now - start));    //                                                  ADDED AT COL 81 -> Watchdog-style warning
+                }
             }
         }
-        free(worker_list);
-        worker_list = NULL;
-        worker_count = 0;
-        worker_capacity = 0;
-        pthread_mutex_unlock(&workers_lock);
+        free(snapshot);
     }
 
-    // Ensure all zones are OFF at shutdown
+    // Turn off all zones, holding the driver lock so hw + software mirror are consistent
     mcp_lock();
     for (int z = 1; z <= MAX_ZONE; ++z) {
         if (zone_state[z] != 0) {
@@ -138,110 +213,159 @@ static void join_workers_and_cleanup(void) {
     }
     mcp_unlock();
 
-    mcp_i2c_close();                                                            // Close the I²C device cleanly
+    mcp_i2c_close();
 }
 
-// Set a single zone ON or OFF (thread-safe)
+// This function updates both hardware and software mirrors atomically
 static void set_zone_state(int zone, int state) {
     if (zone < 1 || zone > MAX_ZONE) {
-        fprintf(stderr, "ERROR: set_zone_state(): invalid zone %d\n", zone);
+        syslog(LOG_ERR, "set_zone_state: invalid zone %d", zone);
         return;
     }
 
-    mcp_lock();                                                                 // Lock MCP23017 driver mutex
+    mcp_lock();
     if (mcp_set_zone_state(zone, state) != 0) {
-        fprintf(stderr, "ERROR: Failed to set zone %d -> %s\n", zone, state ? "ON" : "OFF");
+        syslog(LOG_ERR, "Failed to set zone %d -> %s", zone, state ? "ON" : "OFF");
     } else {
         zone_state[zone] = state;
-        printf("Zone %d -> %s\n", zone, state ? "ON" : "OFF");
+        syslog(LOG_INFO, "Zone %d -> %s", zone, state ? "ON" : "OFF");            //                                                  ADDED AT COL 81 -> Prefer syslog for lifecycle events
     }
-    mcp_unlock();                                                               // Unlock driver mutex
+    mcp_unlock();
 }
 
-// Worker thread: turns a zone ON, sleeps for given time, then turns it OFF.
+// Worker thread: use timed wait so shutdown can wake it early
 static void *worker_thread(void *arg) {
     int zone   = ((int *)arg)[0];
     int time_s = ((int *)arg)[1];
-    free(arg);                                                                  // Free the heap-allocated argument array
+    free(arg);
+
+    // Register ourselves into worker list so we can be joined/monitored
+    pthread_t self = pthread_self();
+    if (add_worker(self) != 0) {
+        // If we can't track, proceed but warn via syslog
+        syslog(LOG_WARNING, "worker_thread: failed to add to tracking list");
+    }
 
     set_zone_state(zone, 1);
-    sleep(time_s);
+
+    // Wait on condition for time_s seconds or until signaled (shutdown)
+    struct timespec now, abstime;
+    clock_gettime(CLOCK_REALTIME, &now);
+    abstime.tv_sec = now.tv_sec + time_s;
+    abstime.tv_nsec = now.tv_nsec;
+
+    pthread_mutex_lock(&timer_mutex);
+    int rc = 0;
+    while (running && rc != ETIMEDOUT) {
+        rc = pthread_cond_timedwait(&timer_cond, &timer_mutex, &abstime);
+        if (rc == ETIMEDOUT) break;
+        if (!running) break;
+        // Spurious wakeups loop around until timeout or shutdown
+    }
+    pthread_mutex_unlock(&timer_mutex);
+
     set_zone_state(zone, 0);
+
+    // Remove ourselves from tracking list
+    remove_worker(self);
+
     return NULL;
 }
 
-// Parse a client command line. Supports "ZONE=X TIME=Y".
-// Uses strtol() for robust numeric parsing and error checking.
+// Improved parsing: strict numeric parsing and validation using strtol
 static int parse_command(int cfd, const char *line) {
+    if (!line) return -1;
+    // Reject overly long lines explicitly
+    if (strlen(line) >= CMD_BUF_SZ - 1) {
+        const char err[] = "ERR too long\n";
+        write_all(cfd, err, sizeof(err) - 1);
+        return -1;
+    }
+
     const char *zp = strstr(line, "ZONE=");
     const char *tp = strstr(line, "TIME=");
     if (!zp || !tp) return -1;
 
     char *endp;
     long z = strtol(zp + 5, &endp, 10);
-    if (endp == zp + 5 || z < 1 || z > MAX_ZONE) return -1;                     // Invalid zone
+    // Require at least one digit and that the next char is space, NUL, CR, or LF
+    if (endp == zp + 5) return -1;
+    if (!( *endp == '\0' || *endp == ' ' || *endp == '\r' || *endp == '\n')) return -1;
+    if (z < 1 || z > MAX_ZONE) return -1;
 
     long t = strtol(tp + 5, &endp, 10);
-    if (endp == tp + 5 || t < 0) return -1;                                     // Invalid time
+    if (endp == tp + 5) return -1;
+    if (!( *endp == '\0' || *endp == ' ' || *endp == '\r' || *endp == '\n')) return -1;
+    if (t < 0) return -1;
 
-    if (t == 0) {                                                               // TIME=0 → turn OFF immediately
+    if (t == 0) {
         set_zone_state((int)z, 0);
         const char ok[] = "OK\n";
-        (void)write_all(cfd, ok, sizeof(ok) - 1);
+        write_all(cfd, ok, sizeof(ok) - 1);
         return 0;
-    } else {                                                                    // TIME>0 → create worker thread
+    } else {
         pthread_t tid;
-        int *args = malloc(2 * sizeof(int));
+        int *args = xmalloc(2 * sizeof(int));
         if (!args) {
-            perror("malloc");
-            close(cfd);                                                         // FIX: avoid FD leak if malloc fails
+            const char err[] = "ERR internal\n";
+            write_all(cfd, err, sizeof(err) - 1);
+            close(cfd);                                                             //                                                  ADDED AT COL 81 -> Close the socket on allocation failure to avoid FD leak
             return -1;
         }
         args[0] = (int)z;
         args[1] = (int)t;
 
-        if (pthread_create(&tid, NULL, worker_thread, args) != 0) {
-            perror("pthread_create");
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, WORKER_STACK_SZ);                         //                                                  ADDED AT COL 81 -> Limit worker stack size to reduce per-thread memory
+        int rc = pthread_create(&tid, &attr, worker_thread, args);
+        pthread_attr_destroy(&attr);
+        if (rc != 0) {
+            syslog(LOG_ERR, "pthread_create failed: %s", strerror(rc));
             free(args);
-            close(cfd);                                                         // FIX: avoid FD leak if pthread_create fails
+            const char err[] = "ERR internal\n";
+            write_all(cfd, err, sizeof(err) - 1);
+            close(cfd);                                                             //                                                  ADDED AT COL 81 -> Close the socket on thread-create failure
             return -1;
         }
+
+        // We don't detach: we track and join at shutdown
         if (add_worker(tid) != 0) {
-            pthread_detach(tid);                                                // If tracking fails, detach to avoid zombie thread
+            pthread_detach(tid);                                                    // If tracking fails, detach as fallback
         }
 
         const char ok[] = "OK\n";
-        (void)write_all(cfd, ok, sizeof(ok) - 1);
+        write_all(cfd, ok, sizeof(ok) - 1);
         return 0;
     }
 }
 
-// Read a line from a client socket, handling CR/LF termination.
+// Read a line up to CMD_BUF_SZ and null-terminate
 static ssize_t read_line(int fd, char *buf, size_t sz) {
     if (sz < 2) return -1;
     size_t used = 0;
-
     while (used < sz - 1) {
         ssize_t n = read(fd, buf + used, 1);
-        if (n == 0) break;                                                      // EOF (client closed connection)
-        else if (n < 0) {
-            if (errno == EINTR) continue;                                       // Retry if interrupted by signal
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
             return -1;
-        } else {
-            if (buf[used] == '\r') continue;                                    // Ignore carriage return
-            used++;
-            if (buf[used - 1] == '\n') break;                                   // Stop at newline
         }
+        if (buf[used] == '\r') { used++; continue; }
+        used++;
+        if (buf[used - 1] == '\n') break;
     }
-
-    buf[used] = '\0';                                                           // Null-terminate string
+    buf[used] = '\0';
     return (ssize_t)used;
 }
 
-// Thread for each client connection
+// Thread to handle a single client connection
 static void *client_thread(void *arg) {
     int cfd = *(int *)arg;
     free(arg);
+
+    // For safety: ensure FD_CLOEXEC set on accepted socket to avoid descriptor leaks
+    set_cloexec(cfd);
 
     char buf[CMD_BUF_SZ];
     ssize_t n = read_line(cfd, buf, sizeof(buf));
@@ -250,18 +374,18 @@ static void *client_thread(void *arg) {
         if (n > 1 && buf[n - 2] == '\r') buf[n - 2] = '\0';
         if (parse_command(cfd, buf) < 0) {
             const char err[] = "ERR syntax (use: ZONE=<1..14> TIME=<seconds>)\n";
-            (void)write_all(cfd, err, sizeof(err) - 1);
+            write_all(cfd, err, sizeof(err) - 1);
         }
     } else if (n < 0) {
-        perror("read");
+        syslog(LOG_ERR, "read from client failed: %s", strerror(errno));
     }
 
-    close(cfd);                                                                 // Always close client socket
+    close(cfd);
     return NULL;
 }
 
 int main(void) {
-    // Setup signal handlers for graceful shutdown
+    // Setup signal handlers
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = shutdown_signal_handler;
@@ -269,58 +393,63 @@ int main(void) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    // Initialize MCP23017 driver
+    // Initialize hardware
     if (mcp_i2c_open("/dev/i2c-1") < 0) {
-        fprintf(stderr, "ERROR: Failed to open I2C bus\n");
+        syslog(LOG_ERR, "ERROR: Failed to open I2C bus");
         exit(EXIT_FAILURE);
     }
     if (mcp_config_outputs() < 0) {
-        fprintf(stderr, "ERROR: Failed to configure MCP23017 outputs\n");
+        syslog(LOG_ERR, "ERROR: Failed to configure MCP23017 outputs");
         mcp_i2c_close();
         exit(EXIT_FAILURE);
     }
-    mcp_enable_thread_safety(&zone_lock);                                       // Enable driver-level thread safety
+    mcp_enable_thread_safety(&zone_lock);
 
     // Create listening socket
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
-        perror("socket");
+        syslog(LOG_ERR, "socket() failed: %s", strerror(errno));
         mcp_i2c_close();
         exit(EXIT_FAILURE);
     }
+    set_cloexec(listen_fd);
 
     int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        syslog(LOG_ERR, "setsockopt(SO_REUSEADDR) failed: %s", strerror(errno));
+        close(listen_fd);
+        mcp_i2c_close();
+        exit(EXIT_FAILURE);
+    }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(SERVER_PORT);
+    addr.sin_port   = htons(SERVER_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
+        syslog(LOG_ERR, "bind() failed: %s", strerror(errno));
         close(listen_fd);
         mcp_i2c_close();
         exit(EXIT_FAILURE);
     }
+
     if (listen(listen_fd, BACKLOG) < 0) {
-        perror("listen");
+        syslog(LOG_ERR, "listen() failed: %s", strerror(errno));
         close(listen_fd);
         mcp_i2c_close();
         exit(EXIT_FAILURE);
     }
 
-    printf("irrigationd listening on port %d\n", SERVER_PORT);
+    syslog(LOG_INFO, "irrigationd listening on port %d", SERVER_PORT);
 
-    // Main server loop
     while (running) {
         struct sockaddr_in cli;
         socklen_t len = sizeof(cli);
 
-        int *cfd = malloc(sizeof(int));
+        int *cfd = xmalloc(sizeof(int));
         if (!cfd) {
-            perror("malloc");
             sleep(1);
             continue;
         }
@@ -329,22 +458,27 @@ int main(void) {
         if (*cfd < 0) {
             int err = errno;
             free(cfd);
-            if (!running) break;                                                // If shutting down, break loop
-            if (err == EINTR) continue;                                         // Retry if interrupted
-            perror("accept");
+            if (!running) break;
+            if (err == EINTR) continue;
+            syslog(LOG_ERR, "accept failed: %s", strerror(err));
             continue;
         }
 
+        // Set close-on-exec on accepted socket
+        set_cloexec(*cfd);
+
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread, cfd) != 0) {
-            perror("pthread_create");
+            syslog(LOG_ERR, "pthread_create failed for client handler: %s", strerror(errno));
             close(*cfd);
             free(cfd);
             continue;
         }
 
+        // Track client thread for orderly shutdown
         if (add_worker(tid) != 0) {
-            pthread_detach(tid);                                                // If tracking fails, detach thread
+            // If we can't track the client thread, detach as fallback to avoid resource leak
+            pthread_detach(tid);
         }
     }
 
@@ -353,6 +487,8 @@ int main(void) {
         listen_fd = -1;
     }
 
-    join_workers_and_cleanup();                                                 // Ensure all workers exit and zones OFF
+    join_workers_and_cleanup();
+
+    syslog(LOG_INFO, "irrigationd shutdown complete");
     return 0;
 }

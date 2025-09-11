@@ -16,13 +16,14 @@
 #include <stdlib.h>                                                             // Provides general utilities like exit()
 #include <stdint.h>                                                             // Provides fixed-width integer types like uint8_t for precise control
 #include <unistd.h>                                                             // Provides POSIX operating system API, including read, write, and close
-#include <fcntl.h>                                                              // Provides file control options, used here for open()
+#include <fcntl.h>                                                              // Provides file control options, used here for open() and fcntl()
 #include <errno.h>                                                              // Provides access to the global `errno` variable for error reporting
 #include <string.h>                                                             // Provides string-handling functions, especially strerror to get error messages
 #include <sys/ioctl.h>                                                          // Provides the ioctl function for device-specific control operations
 #include <linux/i2c-dev.h>                                                      // Provides the I2C-specific definitions and constants for ioctl
 #include <pthread.h>                                                            // Provides POSIX threads functions for multi-threading support (mutex)
 #include <syslog.h>                                                             // Provides functions for logging messages to the system logger
+#include <time.h>                                                               // For clock_gettime when needed
 
 #include "mcp23017.h"                                                           // Includes the public declarations for this driver module
 
@@ -37,22 +38,40 @@ static uint8_t g_debug = 0;                                                     
 // the configured mutex. Callers should wrap composite hardware+software sequences
 // with mcp_lock(); ... mcp_unlock(); to guarantee atomic behavior without risk of deadlocks.
 
+// Set the FD_CLOEXEC flag on a file descriptor so it won't leak into exec'd children
+static void set_cloexec(int fd) {
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFD);
+    if (flags == -1) return;
+    (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
 int mcp_i2c_open(const char *devnode) {
-    g_fd = open(devnode, O_RDWR);                                               // Open the specified I2C device file (e.g., "/dev/i2c-1") for reading and writing.
+    g_fd = open(devnode, O_RDWR);                                               // Open the specified I2C device file (e.g., "/dev/i2c-1")
     if (g_fd < 0) {                                                             // System calls return -1 on error, so we must always check the result.
-        perror("open(i2c)");                                                    // perror() prints a user-friendly error message to stderr based on `errno`.
-        syslog(LOG_ERR, "Failed to open I2C bus %s: %s", devnode, strerror(errno));// syslog() sends a structured message to the system log for robust diagnostics.
-        return -1;                                                              // Return a failure code to the caller.
+        perror("open(i2c)");
+        syslog(LOG_ERR, "Failed to open I2C bus %s: %s", devnode, strerror(errno));
+        return -1;
     }
+
+    // Ensure the descriptor is not leaked to children (safety if daemon later execs)
+    set_cloexec(g_fd);                                                          //                                                  ADDED AT COL 81 -> Prevent descriptor leak across exec()
 
     // After opening the bus, we must specify which slave device we want to talk to.
     if (ioctl(g_fd, I2C_SLAVE, MCPADDR) < 0) {                                  // `ioctl` performs device-specific commands. I2C_SLAVE sets the target address.
-        perror("ioctl(I2C_SLAVE)");                                             // Log the error if we can't set the slave address.
+        perror("ioctl(I2C_SLAVE)");
         syslog(LOG_ERR, "Failed to set I2C slave address 0x%02x: %s", MCPADDR, strerror(errno));
-        close(g_fd);                                                            // It's crucial to clean up (close the file) if a step fails.
-        g_fd = -1;                                                              // Reset the global file descriptor to its initial invalid state.
-        return -1;                                                              // Propagate the failure.
+        close(g_fd);
+        g_fd = -1;
+        return -1;
     }
+
+    // Set debug flag from environment if requested (convenience for development)
+    if (getenv("IRRIGATIOND_DEBUG")) {                                          //                                                  ADDED AT COL 81 -> Allow enabling debug via env var
+        g_debug = 1;
+        syslog(LOG_INFO, "MCP23017 debug enabled via IRRIGATIOND_DEBUG");
+    }
+
     return 0;                                                                   // Return 0 to indicate success.
 }
 
@@ -84,13 +103,14 @@ void mcp_unlock(void) {
 
 static int mcp_write(uint8_t reg, uint8_t val) {
     if (g_fd < 0) {
-        syslog(LOG_ERR, "mcp_write called with invalid file descriptor");
+        syslog(LOG_ERR, "mcp_write called with invalid file descriptor");        //                                                  ADDED AT COL 81 -> Defensive logging for invalid state
         return -1;
     }
 
     uint8_t buf[2] = { reg, val };                                              // An I2C write requires sending the register address followed by the data.
-    if (write(g_fd, buf, 2) != 2) {                                             // Attempt to write the 2-byte buffer to the device.
-        perror("mcp_write");                                                    // `write` should return the number of bytes written; if it's not 2, an error occurred.
+    ssize_t w = write(g_fd, buf, 2);
+    if (w != 2) {                                                               // Attempt to write the 2-byte buffer to the device.
+        if (w < 0) perror("mcp_write");
         syslog(LOG_ERR, "I2C write failed to reg 0x%02x: %s", reg, strerror(errno));
         return -1;
     }
@@ -99,7 +119,7 @@ static int mcp_write(uint8_t reg, uint8_t val) {
 
 static int mcp_read(uint8_t reg, uint8_t *out) {
     if (g_fd < 0) {
-        syslog(LOG_ERR, "mcp_read called with invalid file descriptor");
+        syslog(LOG_ERR, "mcp_read called with invalid file descriptor");         //                                                  ADDED AT COL 81 -> Defensive logging for invalid state
         return -1;
     }
 
