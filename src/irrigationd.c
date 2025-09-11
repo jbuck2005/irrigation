@@ -48,7 +48,6 @@ static pthread_t *worker_list = NULL;
 static size_t worker_count = 0;
 static size_t worker_capacity = 0;
 static const char *g_auth_token = NULL;
-static int g_bind_inaddr_any = 0;           // legacy flag (kept for compatibility)
 
 // -----------------------------------------------------------------------------
 // Memory-safe allocation wrappers with centralized error handling
