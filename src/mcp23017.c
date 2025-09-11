@@ -20,29 +20,26 @@
  *   - If IRRIGATIOND_DEBUG is set in the environment, verbose debug logging is enabled
  */
 
-#include <stdio.h>                                                              // Standard I/O (fprintf, perror)
-#include <stdlib.h>                                                             // General utilities (exit, getenv)
-#include <stdint.h>                                                             // Fixed-width integer types (uint8_t, etc.)
-#include <unistd.h>                                                             // POSIX API (read, write, close)
-#include <fcntl.h>                                                              // File control (open, fcntl)
-#include <errno.h>                                                              // Access to errno for error reporting
-#include <string.h>                                                             // String handling (strerror, memcpy)
-#include <sys/ioctl.h>                                                          // ioctl() for device configuration
-#include <linux/i2c-dev.h>                                                      // I²C-specific ioctl definitions
-#include <pthread.h>                                                            // For optional mutex-based thread safety
-#include <syslog.h>                                                             // Syslog logging (LOG_ERR, LOG_INFO, etc.)
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <linux/i2c-dev.h>
+#include <pthread.h>
+#include <syslog.h>
 
-#include "mcp23017.h"                                                           // Public declarations for MCP23017 interface
+#include "mcp23017.h"
 
 // --- Global State ---
-// We keep minimal state here. All functions operate on the file descriptor
-// and optionally use a caller-provided mutex for thread safety.
+static int g_fd = -1;                                                           // File descriptor for the I2C bus; -1 indicates it's not open.
+static pthread_mutex_t *g_mutex = NULL;                                         // Pointer to an external mutex, enabling optional thread safety.
+static uint8_t g_debug = 0;                                                     // A flag to enable or disable verbose debug logging.
 
-static int g_fd = -1;                                                           // Active file descriptor for /dev/i2c-X
-static pthread_mutex_t *g_mutex = NULL;                                         // External mutex pointer (set by irrigationd)
-static uint8_t g_debug = 0;                                                     // Debug flag (enabled if IRRIGATIOND_DEBUG is set)
-
-// Utility: set FD_CLOEXEC so child processes won’t inherit our I²C FD
+// Set FD_CLOEXEC on a file descriptor so it won't leak into exec'd children
 static void set_cloexec(int fd) {
     if (fd < 0) return;
     int flags = fcntl(fd, F_GETFD);
@@ -50,9 +47,8 @@ static void set_cloexec(int fd) {
     (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
-// Open the I²C device node and configure for MCP23017 access
 int mcp_i2c_open(const char *devnode) {
-    openlog("mcp23017", LOG_PID | LOG_CONS, LOG_DAEMON);                        // Open syslog connection tagged “mcp23017”
+    openlog("mcp23017", LOG_PID | LOG_CONS, LOG_DAEMON);                        //                                                  ADDED AT COL 81 -> Open syslog connection with tag "mcp23017"
 
     g_fd = open(devnode, O_RDWR);
     if (g_fd < 0) {
@@ -61,18 +57,17 @@ int mcp_i2c_open(const char *devnode) {
         return -1;
     }
 
-    set_cloexec(g_fd);                                                          // Ensure FD does not leak across exec()
+    set_cloexec(g_fd);
 
-    if (ioctl(g_fd, I2C_SLAVE, MCPADDR) < 0) {                                  // Bind the FD to MCP23017’s I²C address
+    if (ioctl(g_fd, I2C_SLAVE, MCPADDR) < 0) {
         perror("ioctl(I2C_SLAVE)");
-        syslog(LOG_ERR, "Failed to set I2C slave address 0x%02x: %s",
-               MCPADDR, strerror(errno));
+        syslog(LOG_ERR, "Failed to set I2C slave address 0x%02x: %s", MCPADDR, strerror(errno));
         close(g_fd);
         g_fd = -1;
         return -1;
     }
 
-    if (getenv("IRRIGATIOND_DEBUG")) {                                          // Debug enabled via environment variable
+    if (getenv("IRRIGATIOND_DEBUG")) {
         g_debug = 1;
         syslog(LOG_INFO, "MCP23017 debug enabled via IRRIGATIOND_DEBUG");
     }
@@ -80,17 +75,15 @@ int mcp_i2c_open(const char *devnode) {
     return 0;
 }
 
-// Close the I²C device and release resources
 void mcp_i2c_close(void) {
     if (g_fd >= 0) {
         close(g_fd);
     }
     g_fd = -1;
 
-    closelog();                                                                 // Close syslog connection on shutdown
+    closelog();                                                                 //                                                  ADDED AT COL 81 -> Close syslog connection when device is closed
 }
 
-// Enable/disable locking with external mutex
 void mcp_lock(void) {
     if (g_mutex) pthread_mutex_lock(g_mutex);
 }
@@ -99,7 +92,6 @@ void mcp_unlock(void) {
     if (g_mutex) pthread_mutex_unlock(g_mutex);
 }
 
-// Write a single byte to a register
 static int mcp_write(uint8_t reg, uint8_t val) {
     if (g_fd < 0) {
         syslog(LOG_ERR, "mcp_write called with invalid file descriptor");
@@ -116,7 +108,6 @@ static int mcp_write(uint8_t reg, uint8_t val) {
     return 0;
 }
 
-// Read a single byte from a register
 static int mcp_read(uint8_t reg, uint8_t *out) {
     if (g_fd < 0) {
         syslog(LOG_ERR, "mcp_read called with invalid file descriptor");
@@ -143,21 +134,19 @@ static int mcp_read(uint8_t reg, uint8_t *out) {
     return 0;
 }
 
-// Configure both GPIO ports as outputs
 int mcp_config_outputs(void) {
-    if (mcp_write(IODIRA, 0x00)) return -1;                                     // All A pins as outputs
-    if (mcp_write(IODIRB, 0x00)) return -1;                                     // All B pins as outputs
+    if (mcp_write(IODIRA, 0x00)) return -1;
+    if (mcp_write(IODIRB, 0x00)) return -1;
     return 0;
 }
 
-// Map logical zone number to MCP23017 register and bit mask
 int mcp_map_zone(int zone, uint8_t *reg, uint8_t *mask) {
     if (zone >= 1 && zone <= 8) {
-        *reg  = GPIOA;                                                          // Zones 1–8 map to GPIOA pins 0–7
+        *reg  = GPIOA;
         *mask = (uint8_t)(1u << (zone - 1));
         return 0;
     } else if (zone >= 9 && zone <= 14) {
-        *reg = GPIOB;                                                           // Zones 9–14 map to GPIOB pins 5–0
+        *reg = GPIOB;
         static const uint8_t bmap[] = {
             (1u << 5), (1u << 4), (1u << 3),
             (1u << 2), (1u << 1), (1u << 0)
@@ -165,11 +154,10 @@ int mcp_map_zone(int zone, uint8_t *reg, uint8_t *mask) {
         *mask = bmap[zone - 9];
         return 0;
     } else {
-        return -1;                                                              // Invalid zone number
+        return -1;
     }
 }
 
-// Set the output state (ON/OFF) for a logical zone
 int mcp_set_zone_state(int zone, int on) {
     uint8_t reg, mask;
     if (mcp_map_zone(zone, &reg, &mask) != 0) {
@@ -182,15 +170,12 @@ int mcp_set_zone_state(int zone, int on) {
     uint8_t current_val;
     if (mcp_read(reg, &current_val) == 0) {
         uint8_t new_val = on ? (current_val | mask) : (current_val & ~mask);
-
         if (g_debug) {
             fprintf(stderr, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)\n",
                     zone, on ? "ON" : "OFF", current_val, new_val, reg);
-            syslog(LOG_DEBUG,
-                   "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)",
+            syslog(LOG_DEBUG, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)",
                    zone, on ? "ON" : "OFF", current_val, new_val, reg);
         }
-
         rc = mcp_write(reg, new_val);
         if (rc != 0) {
             syslog(LOG_ERR, "mcp_write failed during state set for zone %d", zone);
@@ -201,7 +186,6 @@ int mcp_set_zone_state(int zone, int on) {
     return rc;
 }
 
-// Allow caller (daemon) to provide a mutex for thread safety
 void mcp_enable_thread_safety(pthread_mutex_t *external_mutex) {
     g_mutex = external_mutex;
 }
