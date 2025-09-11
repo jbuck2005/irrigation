@@ -292,6 +292,14 @@ static int parse_command(int cfd, const char *line) {
     if (!( *endp == '\0' || *endp == ' ' || *endp == '\r' || *endp == '\n')) return -1;
     if (t < 0) return -1;
 
+    // --- NEW CHECK: enforce maximum TIME of 24h ---
+    if (t > 86400) {
+        syslog(LOG_ERR, "Rejected TIME=%ld (exceeds 24h limit)", t);
+        const char err[] = "ERR TIME too large (max 86400)\n";
+        write_all(cfd, err, sizeof(err) - 1);
+        return -1;
+    }
+
     if (t == 0) {
         set_zone_state((int)z, 0);
         const char ok[] = "OK\n";
@@ -332,6 +340,7 @@ static int parse_command(int cfd, const char *line) {
         return 0;
     }
 }
+
 
 // --- Networking Helpers ---
 
