@@ -65,6 +65,7 @@ static size_t worker_count = 0;
 static size_t worker_capacity = 0;
 static char *g_auth_token = NULL;
 static volatile sig_atomic_t shutting_down = 0;
+static volatile int listen_fd = -1;
 
 // -----------------------------------------------------------------------------
 // Worker tracking helpers
@@ -394,7 +395,7 @@ int main(void) {
     sem_init(&worker_slots, 0, MAX_WORKERS);
     rl_init();
 
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { perror("socket"); exit(1); }
 
     // set CLOEXEC
