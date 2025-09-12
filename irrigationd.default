@@ -1,0 +1,2 @@
+IRRIGATIOND_TOKEN=changeme-very-secret-token
+IRRIGATIOND_BIND_ADDR=127.0.0.1

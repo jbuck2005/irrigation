@@ -36,6 +36,7 @@
 #define SERVER_PORT     4242                                                       // TCP port to listen on
 #define CMD_BUF_SZ      256                                                        // Max command length in bytes
 #define MAX_WORKERS     32                                                         // Max concurrent worker threads
+#define MAX_CLIENTS     16                                                         // FIX: Max concurrent client connections
 
 // -----------------------------------------------------------------------------
 // Shared state
@@ -43,6 +44,7 @@
 static int zone_state[MAX_ZONE+1];          // zone_state[z] = 1 if ON, 0 if OFF
 static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
 static sem_t worker_slots;
+static sem_t client_slots;                  // FIX: Semaphore for limiting client threads
 static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t *worker_list = NULL;
 static size_t worker_count = 0;
@@ -149,12 +151,9 @@ static void *worker_thread(void *arg) {
         fprintf(stderr, "worker_thread: null arg\n");
         return NULL;
     }
-
-    if (sem_wait(&worker_slots) != 0) {
-        fprintf(stderr, "worker_thread: failed to acquire slot semaphore\n");
-        free(wa);
-        return NULL;
-    }
+    
+    // This worker thread already has a slot acquired by the client thread
+    // No need to call sem_wait(&worker_slots) here.
 
     set_zone_state(wa->zone, 1);
     if (wa->duration > 0) {
@@ -172,46 +171,68 @@ static void *worker_thread(void *arg) {
 // Command parser
 // -----------------------------------------------------------------------------
 
-// Extract key=value pairs from the command string
-static char *get_kv(const char *cmd, const char *key) {
-    size_t klen = strlen(key);
-    const char *p = strstr(cmd, key);
-    if (p && p[klen] == '=') {
-        return (char *)(p + klen + 1);
+// FIX: Replaced get_kv and old parse_command with a robust, token-based parser
+static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
+    char cmd[CMD_BUF_SZ];
+    strncpy(cmd, cmd_const, sizeof(cmd));
+    cmd[sizeof(cmd) - 1] = '\0'; // Ensure null termination
+
+    char *p_zone = NULL, *p_time = NULL, *p_token = NULL;
+    char *saveptr;
+    char *token = strtok_r(cmd, " \t\n\r", &saveptr);
+
+    while (token != NULL) {
+        if (strncmp(token, "ZONE=", 5) == 0) {
+            p_zone = token + 5;
+        } else if (strncmp(token, "TIME=", 5) == 0) {
+            p_time = token + 5;
+        } else if (strncmp(token, "TOKEN=", 6) == 0) {
+            p_token = token + 6;
+        }
+        token = strtok_r(NULL, " \t\n\r", &saveptr);
     }
-    return NULL;
-}
 
-static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
-    char *zone_s = get_kv(cmd, "ZONE");
-    char *time_s = get_kv(cmd, "TIME");
-    char *token  = get_kv(cmd, "TOKEN");
-
-    if (!zone_s || !time_s) {
+    if (!p_zone || !p_time) {
         const char err[] = "ERR missing ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME): '%s'\n", addrbuf, cmd);
+        fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME): '%s'\n", addrbuf, cmd_const);
         return -1;
     }
 
-    if (!token || strcmp(token, g_auth_token) != 0) {
+    if (!p_token || strcmp(p_token, g_auth_token) != 0) {
         const char err[] = "ERR auth required\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (bad/missing token): '%s'\n", addrbuf, cmd);
+        fprintf(stderr, "[%s] Rejected command (bad/missing token): '%s'\n", addrbuf, cmd_const);
         return -1;
     }
 
-    int zone = atoi(zone_s);
-    int duration = atoi(time_s);
+    char *endptr;
+    long zone_l = strtol(p_zone, &endptr, 10);
+    if (*endptr != '\0') {
+        const char err[] = "ERR invalid ZONE format\n";
+        write(cfd, err, sizeof(err) - 1);
+        fprintf(stderr, "[%s] Rejected command (invalid zone format): '%s'\n", addrbuf, cmd_const);
+        return -1;
+    }
+
+    long duration_l = strtol(p_time, &endptr, 10);
+    if (*endptr != '\0') {
+        const char err[] = "ERR invalid TIME format\n";
+        write(cfd, err, sizeof(err) - 1);
+        fprintf(stderr, "[%s] Rejected command (invalid time format): '%s'\n", addrbuf, cmd_const);
+        return -1;
+    }
+    
+    int zone = (int)zone_l;
+    int duration = (int)duration_l;
 
     if (zone < 1 || zone > MAX_ZONE || duration < 0 || duration > 86400) {        // Enforce 24h max
         const char err[] = "ERR invalid ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (invalid zone/time): '%s'\n", addrbuf, cmd);
+        fprintf(stderr, "[%s] Rejected command (invalid zone/time): '%s'\n", addrbuf, cmd_const);
         return -1;
     }
 
-    // Special case: TIME=0 → turn OFF immediately, no worker
     if (duration == 0) {
         set_zone_state(zone, 0);
         const char ok[] = "OK\n";
@@ -219,8 +240,15 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
         fprintf(stderr, "[%s] Zone %d OFF (immediate stop)\n", addrbuf, zone);
         return 0;
     }
+    
+    // Acquire a worker slot before creating the thread
+    if (sem_wait(&worker_slots) != 0) {
+        fprintf(stderr, "Failed to acquire worker slot: %s\n", strerror(errno));
+        const char err[] = "ERR server busy\n";
+        write(cfd, err, sizeof(err) - 1);
+        return -1;
+    }
 
-    // Normal timed run
     struct worker_arg *wa = xmalloc(sizeof(struct worker_arg));
     wa->zone = zone;
     wa->duration = duration;
@@ -230,6 +258,7 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
     if (rc != 0) {
         fprintf(stderr, "pthread_create failed: %s\n", strerror(rc));
         free(wa);
+        sem_post(&worker_slots); // Release slot on failure
         const char err[] = "ERR cannot create worker\n";
         write(cfd, err, sizeof(err) - 1);
         return -1;
@@ -238,9 +267,10 @@ static int parse_command(int cfd, const char *cmd, const char *addrbuf) {
 
     const char ok[] = "OK\n";
     write(cfd, ok, sizeof(ok) - 1);
-    fprintf(stderr, "[%s] Accepted command: '%s'\n", addrbuf, cmd);
+    fprintf(stderr, "[%s] Accepted command: '%s'\n", addrbuf, cmd_const);
     return 0;
 }
+
 
 // -----------------------------------------------------------------------------
 // Client thread handler (per connection)
@@ -263,7 +293,7 @@ static ssize_t read_line(int fd, char *buf, size_t sz) {
         ssize_t rc = read(fd, &c, 1);
         if (rc == 1) {
             if (c == '\n') break;
-            buf[i++] = c;
+            if (c != '\r') buf[i++] = c; // Ignore carriage return
         } else if (rc == 0) {
             break;                                                                 // EOF
         } else {
@@ -303,7 +333,7 @@ static void *client_thread(void *arg) {
     }
 
     close(cfd);
-    sem_post(&worker_slots);
+    sem_post(&client_slots); // FIX: Release the client slot
     remove_worker(pthread_self());
     return NULL;
 }
@@ -340,6 +370,7 @@ int main(void) {
     }
 
     sem_init(&worker_slots, 0, MAX_WORKERS);
+    sem_init(&client_slots, 0, MAX_CLIENTS); // FIX: Initialize client slot semaphore
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -385,6 +416,15 @@ int main(void) {
             continue;
         }
 
+        // FIX: Acquire a client slot before creating the handler thread
+        if (sem_wait(&client_slots) != 0) {
+            fprintf(stderr, "Failed to acquire client slot: %s\n", strerror(errno));
+            const char err[] = "ERR server busy\n";
+            write(cfd, err, sizeof(err) - 1);
+            close(cfd);
+            continue;
+        }
+
         struct client_arg *carg = xmalloc(sizeof(struct client_arg));
         carg->cfd = cfd;
         carg->cli = cli;
@@ -394,6 +434,7 @@ int main(void) {
             fprintf(stderr, "pthread_create failed: %s\n", strerror(errno));
             close(cfd);
             free(carg);
+            sem_post(&client_slots); // FIX: Release slot on failure
             continue;
         }
         add_worker(tid);
