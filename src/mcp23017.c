@@ -8,6 +8,7 @@
 #include <sys/ioctl.h>                                                          // ioctl() for device configuration
 #include <linux/i2c-dev.h>                                                      // I²C-specific ioctl definitions
 #include <pthread.h>                                                            // For optional mutex-based thread safety
+#include <syslog.h>                                                             // Syslog logging (LOG_ERR, LOG_INFO, etc.)
 
 #include "mcp23017.h"                                                           // Public declarations for MCP23017 interface
 
@@ -29,11 +30,12 @@ static void set_cloexec(int fd) {
 
 // Open the I²C device node and configure for MCP23017 access
 int mcp_i2c_open(const char *devnode) {
+    openlog("mcp23017", LOG_PID | LOG_CONS, LOG_DAEMON);                        // Open syslog connection tagged “mcp23017”
+
     g_fd = open(devnode, O_RDWR);
     if (g_fd < 0) {
         perror("open(i2c)");
-        fprintf(stderr, "Failed to open I2C bus %s: %s\n", devnode, strerror(errno));
-        fflush(stderr); // Flush stderr
+        syslog(LOG_ERR, "Failed to open I2C bus %s: %s", devnode, strerror(errno));
         return -1;
     }
 
@@ -41,17 +43,17 @@ int mcp_i2c_open(const char *devnode) {
 
     if (ioctl(g_fd, I2C_SLAVE, MCPADDR) < 0) {                                  // Bind the FD to MCP23017’s I²C address
         perror("ioctl(I2C_SLAVE)");
-        fprintf(stderr, "Failed to set I2C slave address 0x%02x: %s\n", MCPADDR, strerror(errno));
-        fflush(stderr); // Flush stderr
+        syslog(LOG_ERR, "Failed to set I2C slave address 0x%02x: %s",
+               MCPADDR, strerror(errno));
         close(g_fd);
         g_fd = -1;
         return -1;
     }
 
-    if (getenv("IRRIGATIOND_DEBUG")) {                                          // Debug enabled via environment variable
+    // Check for debug flag from the environment
+    if (getenv("IRRIGATIOND_DEBUG")) {
         g_debug = 1;
-        fprintf(stderr, "MCP23017 debug enabled via IRRIGATIOND_DEBUG\n");
-        fflush(stderr); // Flush stderr
+        syslog(LOG_INFO, "MCP23017 debug enabled via IRRIGATIOND_DEBUG");
     }
 
     return 0;
@@ -63,6 +65,8 @@ void mcp_i2c_close(void) {
         close(g_fd);
     }
     g_fd = -1;
+
+    closelog();                                                                 // Close syslog connection on shutdown
 }
 
 // Enable/disable locking with external mutex
@@ -77,8 +81,7 @@ void mcp_unlock(void) {
 // Write a single byte to a register
 static int mcp_write(uint8_t reg, uint8_t val) {
     if (g_fd < 0) {
-        fprintf(stderr, "mcp_write called with invalid file descriptor\n");
-        fflush(stderr); // Flush stderr
+        syslog(LOG_ERR, "mcp_write called with invalid file descriptor");
         return -1;
     }
 
@@ -86,14 +89,14 @@ static int mcp_write(uint8_t reg, uint8_t val) {
     ssize_t w = write(g_fd, buf, 2);
     if (w != 2) {
         if (w < 0) perror("mcp_write");
-        fprintf(stderr, "I2C write failed to reg 0x%02x: %s\n", reg, strerror(errno));
-        fflush(stderr); // Flush stderr
+        syslog(LOG_ERR, "I2C write failed to reg 0x%02x: %s", reg, strerror(errno));
         return -1;
     }
 
+    // Debugging output for write
     if (g_debug) {
         fprintf(stderr, "write[0x%02x] => 0x%02x\n", reg, val);
-        fflush(stderr); // Flush stderr
+        syslog(LOG_DEBUG, "write[0x%02x] => 0x%02x", reg, val);
     }
 
     return 0;
@@ -102,29 +105,27 @@ static int mcp_write(uint8_t reg, uint8_t val) {
 // Read a single byte from a register
 static int mcp_read(uint8_t reg, uint8_t *out) {
     if (g_fd < 0) {
-        fprintf(stderr, "mcp_read called with invalid file descriptor\n");
-        fflush(stderr); // Flush stderr
+        syslog(LOG_ERR, "mcp_read called with invalid file descriptor");
         return -1;
     }
 
     uint8_t r = reg;
     if (write(g_fd, &r, 1) != 1) {
         perror("mcp_read (set addr)");
-        fprintf(stderr, "I2C failed to set read address to 0x%02x: %s\n", reg, strerror(errno));
-        fflush(stderr); // Flush stderr
+        syslog(LOG_ERR, "I2C failed to set read address to 0x%02x: %s", reg, strerror(errno));
         return -1;
     }
 
     if (read(g_fd, out, 1) != 1) {
         perror("mcp_read (read data)");
-        fprintf(stderr, "I2C read failed from reg 0x%02x: %s\n", reg, strerror(errno));
-        fflush(stderr); // Flush stderr
+        syslog(LOG_ERR, "I2C read failed from reg 0x%02x: %s", reg, strerror(errno));
         return -1;
     }
 
+    // Debugging output for read
     if (g_debug) {
         fprintf(stderr, "read[0x%02x] => 0x%02x\n", reg, *out);
-        fflush(stderr); // Flush stderr
+        syslog(LOG_DEBUG, "read[0x%02x] => 0x%02x", reg, *out);
     }
 
     return 0;
@@ -161,7 +162,7 @@ int mcp_set_zone_state(int zone, int on) {
     uint8_t reg, mask;
     if (mcp_map_zone(zone, &reg, &mask) != 0) {
         fprintf(stderr, "Invalid zone: %d\n", zone);
-        fflush(stderr); // Flush stderr
+        syslog(LOG_ERR, "Attempted to set invalid zone: %d", zone);
         return -1;
     }
 
@@ -170,13 +171,21 @@ int mcp_set_zone_state(int zone, int on) {
     if (mcp_read(reg, &current_val) == 0) {
         uint8_t new_val = on ? (current_val | mask) : (current_val & ~mask);
 
+        // Debugging output for zone state change
         if (g_debug) {
             fprintf(stderr, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)\n",
                     zone, on ? "ON" : "OFF", current_val, new_val, reg);
-            fflush(stderr); // Flush stderr
+            syslog(LOG_DEBUG,
+                   "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)",
+                   zone, on ? "ON" : "OFF", current_val, new_val, reg);
         }
 
         rc = mcp_write(reg, new_val);
+        if (rc != 0) {
+            syslog(LOG_ERR, "mcp_write failed during state set for zone %d", zone);
+        }
+    } else {
+        syslog(LOG_ERR, "mcp_read failed during state set for zone %d", zone);
     }
     return rc;
 }
@@ -185,4 +194,3 @@ int mcp_set_zone_state(int zone, int on) {
 void mcp_enable_thread_safety(pthread_mutex_t *external_mutex) {
     g_mutex = external_mutex;
 }
-
