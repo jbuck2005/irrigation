@@ -92,7 +92,7 @@ test_rate_limit: $(TEST_RL_OBJS)
 # -------------------------------------------------------------------
 install: $(DAEMON_BIN)
 # Create system user/group if missing
-	if ! id -u irrigationd >/dev/null 2>&1; then \
+	@if ! id -u irrigationd >/dev/null 2>&1; then \
 		echo "Creating system user irrigationd..."; \
 		useradd -r -s /usr/sbin/nologin -d /var/lib/irrigationd -M irrigationd; \
 	fi
@@ -107,16 +107,19 @@ install: $(DAEMON_BIN)
 
 # Install /etc/default/irrigationd if not present
 	install -d $(DESTDIR)$(DEFAULTS_DIR)
-	if [ ! -f $(DESTDIR)$(DEFAULTS_DIR)/irrigationd ]; then \
+	@if [ ! -f $(DESTDIR)$(DEFAULTS_DIR)/irrigationd ]; then \
 		install -m 0640 $(DEFAULTS_FILE) $(DESTDIR)$(DEFAULTS_DIR)/irrigationd; \
 	fi
-	chown root:irrigationd $(DESTDIR)$(DEFAULTS_DIR)/irrigationd
+	@chown root:irrigationd $(DESTDIR)$(DEFAULTS_DIR)/irrigationd
 
 	@echo "Install complete."
 	@echo "Run the following to enable service:"
-	@echo "  systemctl daemon-reexec"
-	@echo "  systemctl enable irrigationd"
-	@echo "  systemctl start irrigationd"
+	@echo ""
+	@echo "sudo systemctl daemon-reexec"
+	@echo "sudo systemctl enable irrigationd"
+	@echo "sudo systemctl start irrigationd"
+	@echo ""
+	@echo "sudo vi sudo vi /etc/default/irrigationd"
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(DAEMON_BIN)
