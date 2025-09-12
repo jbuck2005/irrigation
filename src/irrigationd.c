@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 199309L  // Ensure POSIX functions are available
+#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +15,8 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/time.h>           // For struct timeval and setsockopt
+#include <ifaddrs.h>            // For getifaddrs()
+#include <netdb.h>              // For NI_MAXHOST
 
 // Fallback for strdup if it's not available
 #ifndef strdup
@@ -66,6 +68,7 @@ static size_t worker_capacity = 0;
 static char *g_auth_token = NULL;
 static volatile sig_atomic_t shutting_down = 0;
 static volatile int listen_fd = -1;
+static int self_pipe[2] = {-1, -1};
 
 // -----------------------------------------------------------------------------
 // Worker tracking helpers
@@ -356,14 +359,40 @@ static void *client_thread(void *arg) {
 }
 
 // -----------------------------------------------------------------------------
+// Logging helper for server addresses
+// -----------------------------------------------------------------------------
+static void log_server_addresses(int port) {
+    struct ifaddrs *ifaddr, *ifa;
+    char host[NI_MAXHOST];
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return;
+    }
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+
+        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+        inet_ntop(AF_INET, &sa->sin_addr, host, NI_MAXHOST);
+
+        fprintf(stderr, "  -> Listening on %s:%d (%s)\n", host, port, ifa->ifa_name);
+    }
+
+    freeifaddrs(ifaddr);
+}
+
+// -----------------------------------------------------------------------------
 // Signal handler for graceful shutdown
 // -----------------------------------------------------------------------------
 static void sigint_handler(int signo) {
     (void)signo;
-    shutting_down = 1;
-    // Closing the socket will unblock accept()
-    if (listen_fd >= 0) {
-        close(listen_fd);
+    // Safely notify the main loop by writing to the pipe.
+    // We ignore the return value; there's not much we can do on error.
+    if (write(self_pipe[1], "x", 1) > 0) {
+        // This space is intentionally left blank.
     }
 }
 
@@ -388,7 +417,7 @@ int main(void) {
     const char *bind_addr_str = getenv("IRRIGATIOND_BIND_ADDR");
     if (!bind_addr_str || !*bind_addr_str) {
         bind_addr_str = "127.0.0.1"; // Safe default if not set
-    }    
+    }
 
     if (mcp_i2c_open("/dev/i2c-1") < 0) exit(1);
 
@@ -407,41 +436,84 @@ int main(void) {
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(SERVER_PORT);
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (inet_pton(AF_INET, bind_addr_str, &addr.sin_addr) <= 0) {
+        perror("inet_pton failed for bind address");
+        exit(1);
+    }
 
     if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); exit(1); }
     if (listen(listen_fd, 128) < 0) { perror("listen"); exit(1); }
 
-    fprintf(stderr, "irrigationd listening on port %d\n", SERVER_PORT);
+    // Create the self-pipe for shutdown signalling
+    if (pipe(self_pipe) == -1) {
+        perror("pipe");
+        exit(1);
+    }
+    
+    if (strcmp(bind_addr_str, "0.0.0.0") == 0) {
+        fprintf(stderr, "irrigationd listening on all interfaces (port %d):\n", SERVER_PORT);
+        log_server_addresses(SERVER_PORT);
+    } else {
+        fprintf(stderr, "irrigationd listening on %s:%d\n", bind_addr_str, SERVER_PORT);
+    }
 
     while (!shutting_down) {
-        struct sockaddr_in cli; socklen_t clen = sizeof(cli);
-        int cfd = accept(listen_fd, (struct sockaddr*)&cli, &clen);
-        if (cfd < 0) {
-            if (errno == EINTR) continue;
-            perror("accept");
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(listen_fd, &read_fds);
+        FD_SET(self_pipe[0], &read_fds);
+
+        int max_fd = (listen_fd > self_pipe[0]) ? listen_fd : self_pipe[0];
+
+        int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+
+        if (activity < 0) {
+            if (errno == EINTR) continue; // Interrupted by a signal, loop again
+            perror("select");
+            break; // Exit on other errors
+        }
+
+        // Check if the signal handler wrote to the pipe
+        if (FD_ISSET(self_pipe[0], &read_fds)) {
+            shutting_down = 1; // Set flag and let loop terminate
             continue;
         }
 
-        uint32_t ip = ntohl(cli.sin_addr.s_addr);
-        if (!rl_check_and_consume(ip)) {
-            safe_write(cfd, "ERR rate limit\n", 15);
-            close(cfd);
-            continue;
-        }
+        // Check for a new connection
+        if (FD_ISSET(listen_fd, &read_fds)) {
+            struct sockaddr_in cli;
+            socklen_t clen = sizeof(cli);
+            int cfd = accept(listen_fd, (struct sockaddr*)&cli, &clen);
+            if (cfd < 0) {
+                // This might happen during shutdown, so just log and continue
+                if (!shutting_down) perror("accept");
+                continue;
+            }
 
-        struct client_arg *carg = xmalloc(sizeof(*carg));
-        carg->cfd = cfd;
-        carg->cli = cli;
+            uint32_t ip = ntohl(cli.sin_addr.s_addr);
+            if (!rl_check_and_consume(ip)) {
+                safe_write(cfd, "ERR rate limit\n", 15);
+                close(cfd);
+                continue;
+            }
 
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, client_thread, carg) != 0) {
-            close(cfd);
-            free(carg);
-            continue;
+            struct client_arg *carg = xmalloc(sizeof(*carg));
+            carg->cfd = cfd;
+            carg->cli = cli;
+
+            pthread_t tid;
+            if (pthread_create(&tid, NULL, client_thread, carg) != 0) {
+                close(cfd);
+                free(carg);
+                continue;
+            }
+            add_worker(tid);
         }
-        add_worker(tid);
     }
+
+    // Close the self-pipe descriptors before cleaning up workers
+    close(self_pipe[0]);
+    close(self_pipe[1]);
 
     // Shutdown: cancel worker threads and join
     pthread_mutex_lock(&workers_lock);

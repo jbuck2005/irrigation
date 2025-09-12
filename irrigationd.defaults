@@ -1,7 +1,2 @@
-# Authentication token (must match the one set in Home Assistant config)
 IRRIGATIOND_TOKEN=changeme-very-secret-token
-
-# Bind address:
-# 127.0.0.1 -> only accessible from the same machine (default/recommended)
-# 0.0.0.0   -> listen on all interfaces (less safe)
 IRRIGATIOND_BIND_ADDR=127.0.0.1
