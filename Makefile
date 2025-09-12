@@ -53,11 +53,11 @@ TEST_BINS  := test_auth test_rate_limit
 # Installation paths
 PREFIX      ?= /usr/local
 BINDIR      := $(PREFIX)/bin
-SYSTEMD_DIR ?= /etc/systemd/system
+SYSTEMD_DIR ?= /etc/systemd
 DEFAULTS_DIR?= /etc/default
 
 SERVICE_FILE := irrigationd.service
-DEFAULTS_FILE:= examples/irrigationd.defaults
+DEFAULTS_FILE:= irrigationd.defaults
 
 # -------------------------------------------------------------------
 # Default target
