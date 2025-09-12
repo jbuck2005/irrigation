@@ -91,24 +91,24 @@ test_rate_limit: $(TEST_RL_OBJS)
 # Install / uninstall
 # -------------------------------------------------------------------
 install: $(DAEMON_BIN)
-	# Create system user/group if missing
+# Create system user/group if missing
 	if ! id -u irrigationd >/dev/null 2>&1; then \
-	  echo "Creating system user irrigationd..."; \
-	  useradd -r -s /usr/sbin/nologin -d /var/lib/irrigationd -M irrigationd; \
+		echo "Creating system user irrigationd..."; \
+		useradd -r -s /usr/sbin/nologin -d /var/lib/irrigationd -M irrigationd; \
 	fi
 
-	# Install daemon binary
+# Install daemon binary
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(DAEMON_BIN) $(DESTDIR)$(BINDIR)
 
-	# Install systemd service file
+# Install systemd service file
 	install -d $(DESTDIR)$(SYSTEMD_DIR)
 	install -m 0644 $(SERVICE_FILE) $(DESTDIR)$(SYSTEMD_DIR)/$(SERVICE_FILE)
 
-	# Install /etc/default/irrigationd if not present
+# Install /etc/default/irrigationd if not present
 	install -d $(DESTDIR)$(DEFAULTS_DIR)
 	if [ ! -f $(DESTDIR)$(DEFAULTS_DIR)/irrigationd ]; then \
-	  install -m 0640 $(DEFAULTS_FILE) $(DESTDIR)$(DEFAULTS_DIR)/irrigationd; \
+		install -m 0640 $(DEFAULTS_FILE) $(DESTDIR)$(DEFAULTS_DIR)/irrigationd; \
 	fi
 	chown root:irrigationd $(DESTDIR)$(DEFAULTS_DIR)/irrigationd
 
