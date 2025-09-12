@@ -36,7 +36,12 @@
 #define SERVER_PORT     4242                                                       // TCP port to listen on
 #define CMD_BUF_SZ      256                                                        // Max command length in bytes
 #define MAX_WORKERS     32                                                         // Max concurrent worker threads
-#define MAX_CLIENTS     16                                                         // FIX: Max concurrent client connections
+#define MAX_CLIENTS     16                                                         // Max concurrent client connections
+
+// FIX: Rate Limiting Configuration
+#define MAX_TRACKED_IPS   256                                                      // Max IPs to track for rate limiting
+#define RATE_LIMIT_COUNT  10                                                       // Max connections per IP...
+#define RATE_LIMIT_PERIOD 60                                                       // ...within this many seconds
 
 // -----------------------------------------------------------------------------
 // Shared state
@@ -44,12 +49,25 @@
 static int zone_state[MAX_ZONE+1];          // zone_state[z] = 1 if ON, 0 if OFF
 static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
 static sem_t worker_slots;
-static sem_t client_slots;                  // FIX: Semaphore for limiting client threads
+static sem_t client_slots;
 static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t *worker_list = NULL;
 static size_t worker_count = 0;
 static size_t worker_capacity = 0;
 static const char *g_auth_token = NULL;
+
+// FIX: Data structures for rate limiting
+typedef struct {
+    uint32_t ip_addr;                   // IP address in network byte order
+    time_t timestamps[RATE_LIMIT_COUNT]; // Circular buffer of connection times
+    int head;                           // Index of the oldest timestamp
+    int count;                          // Number of timestamps in the buffer
+    time_t last_seen;                   // For LRU eviction
+} RateLimitEntry;
+
+static RateLimitEntry rate_limit_table[MAX_TRACKED_IPS];
+static pthread_mutex_t rate_limit_lock = PTHREAD_MUTEX_INITIALIZER;
+
 
 // -----------------------------------------------------------------------------
 // Memory-safe allocation wrappers with centralized error handling
@@ -151,9 +169,6 @@ static void *worker_thread(void *arg) {
         fprintf(stderr, "worker_thread: null arg\n");
         return NULL;
     }
-    
-    // This worker thread already has a slot acquired by the client thread
-    // No need to call sem_wait(&worker_slots) here.
 
     set_zone_state(wa->zone, 1);
     if (wa->duration > 0) {
@@ -162,8 +177,8 @@ static void *worker_thread(void *arg) {
     }
 
     free(wa);
-    sem_post(&worker_slots);                                                       // Release slot
-    remove_worker(pthread_self());                                                 // Remove from tracking
+    sem_post(&worker_slots);
+    remove_worker(pthread_self());
     return NULL;
 }
 
@@ -171,11 +186,10 @@ static void *worker_thread(void *arg) {
 // Command parser
 // -----------------------------------------------------------------------------
 
-// FIX: Replaced get_kv and old parse_command with a robust, token-based parser
 static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     char cmd[CMD_BUF_SZ];
     strncpy(cmd, cmd_const, sizeof(cmd));
-    cmd[sizeof(cmd) - 1] = '\0'; // Ensure null termination
+    cmd[sizeof(cmd) - 1] = '\0';
 
     char *p_zone = NULL, *p_time = NULL, *p_token = NULL;
     char *saveptr;
@@ -226,7 +240,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     int zone = (int)zone_l;
     int duration = (int)duration_l;
 
-    if (zone < 1 || zone > MAX_ZONE || duration < 0 || duration > 86400) {        // Enforce 24h max
+    if (zone < 1 || zone > MAX_ZONE || duration < 0 || duration > 86400) {
         const char err[] = "ERR invalid ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (invalid zone/time): '%s'\n", addrbuf, cmd_const);
@@ -241,7 +255,6 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
         return 0;
     }
     
-    // Acquire a worker slot before creating the thread
     if (sem_wait(&worker_slots) != 0) {
         fprintf(stderr, "Failed to acquire worker slot: %s\n", strerror(errno));
         const char err[] = "ERR server busy\n";
@@ -258,7 +271,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     if (rc != 0) {
         fprintf(stderr, "pthread_create failed: %s\n", strerror(rc));
         free(wa);
-        sem_post(&worker_slots); // Release slot on failure
+        sem_post(&worker_slots);
         const char err[] = "ERR cannot create worker\n";
         write(cfd, err, sizeof(err) - 1);
         return -1;
@@ -270,7 +283,6 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     fprintf(stderr, "[%s] Accepted command: '%s'\n", addrbuf, cmd_const);
     return 0;
 }
-
 
 // -----------------------------------------------------------------------------
 // Client thread handler (per connection)
@@ -293,11 +305,11 @@ static ssize_t read_line(int fd, char *buf, size_t sz) {
         ssize_t rc = read(fd, &c, 1);
         if (rc == 1) {
             if (c == '\n') break;
-            if (c != '\r') buf[i++] = c; // Ignore carriage return
+            if (c != '\r') buf[i++] = c;
         } else if (rc == 0) {
-            break;                                                                 // EOF
+            break;
         } else {
-            if (errno == EINTR) continue;                                          // Retry if interrupted
+            if (errno == EINTR) continue;
             return -1;
         }
     }
@@ -333,18 +345,74 @@ static void *client_thread(void *arg) {
     }
 
     close(cfd);
-    sem_post(&client_slots); // FIX: Release the client slot
+    sem_post(&client_slots);
     remove_worker(pthread_self());
     return NULL;
 }
+
+// -----------------------------------------------------------------------------
+// Rate Limiting Logic
+// -----------------------------------------------------------------------------
+
+// FIX: New function to check and update rate limits for a given IP
+static int is_rate_limited(struct in_addr client_ip) {
+    pthread_mutex_lock(&rate_limit_lock);
+
+    time_t now = time(NULL);
+    int found_idx = -1;
+    int evict_idx = 0; // Default to evicting the first entry
+    time_t oldest_seen = (time_t)-1;
+
+    for (int i = 0; i < MAX_TRACKED_IPS; ++i) {
+        if (rate_limit_table[i].ip_addr == client_ip.s_addr) {
+            found_idx = i;
+            break;
+        }
+        if (rate_limit_table[i].last_seen < oldest_seen) {
+            oldest_seen = rate_limit_table[i].last_seen;
+            evict_idx = i;
+        }
+    }
+
+    if (found_idx == -1) {
+        // IP not found, evict the least recently seen entry
+        found_idx = evict_idx;
+        rate_limit_table[found_idx].ip_addr = client_ip.s_addr;
+        rate_limit_table[found_idx].count = 0;
+        rate_limit_table[found_idx].head = 0;
+    }
+
+    RateLimitEntry *entry = &rate_limit_table[found_idx];
+    entry->last_seen = now;
+
+    // If buffer is full, the oldest timestamp is at the current head
+    if (entry->count == RATE_LIMIT_COUNT) {
+        time_t oldest_ts = entry->timestamps[entry->head];
+        if (now - oldest_ts < RATE_LIMIT_PERIOD) {
+            // All timestamps are within the rate limit period
+            pthread_mutex_unlock(&rate_limit_lock);
+            return 1; // Rate limited
+        }
+    }
+
+    // Record the new connection timestamp
+    entry->timestamps[entry->head] = now;
+    entry->head = (entry->head + 1) % RATE_LIMIT_COUNT;
+    if (entry->count < RATE_LIMIT_COUNT) {
+        entry->count++;
+    }
+
+    pthread_mutex_unlock(&rate_limit_lock);
+    return 0; // Not rate limited
+}
+
 
 // -----------------------------------------------------------------------------
 // Main server loop
 // -----------------------------------------------------------------------------
 
 int main(void) {
-    // Use stderr logging (systemd captures stdout/stderr)
-    // Load environment configuration
+    // ... (environment loading and setup as before)
     g_auth_token = getenv("IRRIGATIOND_TOKEN");
     const char *bind_env = getenv("IRRIGATIOND_BIND_ADDR");
     struct in_addr bind_addr = {0};
@@ -370,7 +438,7 @@ int main(void) {
     }
 
     sem_init(&worker_slots, 0, MAX_WORKERS);
-    sem_init(&client_slots, 0, MAX_CLIENTS); // FIX: Initialize client slot semaphore
+    sem_init(&client_slots, 0, MAX_CLIENTS);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -416,7 +484,17 @@ int main(void) {
             continue;
         }
 
-        // FIX: Acquire a client slot before creating the handler thread
+        // FIX: Check rate limit before processing the connection
+        if (is_rate_limited(cli.sin_addr)) {
+            char addrbuf[64];
+            format_client_addr(&cli, addrbuf, sizeof(addrbuf));
+            fprintf(stderr, "[%s] Connection rejected: rate limit exceeded\n", addrbuf);
+            const char err[] = "ERR rate limit exceeded\n";
+            write(cfd, err, sizeof(err)-1);
+            close(cfd);
+            continue;
+        }
+
         if (sem_wait(&client_slots) != 0) {
             fprintf(stderr, "Failed to acquire client slot: %s\n", strerror(errno));
             const char err[] = "ERR server busy\n";
@@ -434,7 +512,7 @@ int main(void) {
             fprintf(stderr, "pthread_create failed: %s\n", strerror(errno));
             close(cfd);
             free(carg);
-            sem_post(&client_slots); // FIX: Release slot on failure
+            sem_post(&client_slots);
             continue;
         }
         add_worker(tid);
