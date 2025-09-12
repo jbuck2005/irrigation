@@ -360,6 +360,10 @@ static void *client_thread(void *arg) {
 static void sigint_handler(int signo) {
     (void)signo;
     shutting_down = 1;
+    // Closing the socket will unblock accept()
+    if (listen_fd >= 0) {
+        close(listen_fd);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -379,6 +383,11 @@ int main(void) {
         fprintf(stderr, "failed to allocate token copy\n");
         exit(1);
     }
+
+    const char *bind_addr_str = getenv("IRRIGATIOND_BIND_ADDR");
+    if (!bind_addr_str || !*bind_addr_str) {
+        bind_addr_str = "127.0.0.1"; // Safe default if not set
+    }    
 
     if (mcp_i2c_open("/dev/i2c-1") < 0) exit(1);
 
