@@ -119,7 +119,7 @@ install: $(DAEMON_BIN)
 	@echo "sudo systemctl enable irrigationd"
 	@echo "sudo systemctl start irrigationd"
 	@echo ""
-	@echo "sudo vi sudo vi /etc/default/irrigationd"
+	@echo "sudo vi /etc/default/irrigationd"
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(DAEMON_BIN)
