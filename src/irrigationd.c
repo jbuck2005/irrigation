@@ -28,15 +28,17 @@ char *strdup(const char *s) {
 
 // Fallback for strlcpy if it's not available
 #ifndef strlcpy
-#define strlcpy(dst, src, size) ({ \
-    size_t len = strlen(src); \
-    if (size > 0) { \
-        size_t copy_len = (len >= size) ? (size - 1) : len; \
-        memcpy(dst, src, copy_len); \
-        dst[copy_len] = '\0'; \
-    } \
-    len; \
-})
+// Provides a standard C implementation of strlcpy to avoid compiler warnings
+// about non-standard GCC extensions.
+static size_t strlcpy(char *dst, const char *src, size_t size) {
+    size_t src_len = strlen(src);
+    if (size > 0) {
+        size_t copy_len = (src_len >= size) ? (size - 1) : src_len;
+        memcpy(dst, src, copy_len);
+        dst[copy_len] = '\0';
+    }
+    return src_len;
+}
 #endif
 
 #include "mcp23017.h"
