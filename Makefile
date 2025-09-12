@@ -21,7 +21,7 @@ CFLAGS  := -Wall -Wextra -Wpedantic -std=c11 -Iinclude
 CFLAGS  += -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -Wformat -Wformat-security
 
 # Linker hardening flags
-LDFLAGS := -lpthread -pie -Wl,-z,relro,-z,now,-z,noexecstack
+LDFLAGS := -lpthread -lrt -pie -Wl,-z,relro,-z,now,-z,noexecstack
 
 # Debug vs release
 ifeq ($(DEBUG),1)
