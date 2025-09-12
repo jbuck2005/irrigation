@@ -1,3 +1,25 @@
+/**
+ * @file mcp23017.c
+ * @brief Driver for the MCP23017 I2C I/O expander for irrigation control
+ *
+ * This module provides a safe and documented interface to the MCP23017
+ * 16-bit I/O expander, used in our irrigation controller to drive zone relays.
+ *
+ * Features:
+ *   - Open and configure the I²C device safely
+ *   - Configure expander ports as outputs
+ *   - Map logical irrigation zones (1..14) to MCP23017 GPIO pins
+ *   - Set zone state ON/OFF with proper register updates
+ *   - Optional thread safety via external mutex integration
+ *   - Integrated syslog logging for errors, warnings, and debug output
+ *
+ * Design Notes:
+ *   - All low-level I²C operations are wrapped in helper functions
+ *   - Errors are reported both to stderr (for dev/debug) and syslog
+ *   - File descriptors are marked FD_CLOEXEC to avoid leaking across exec()
+ *   - If IRRIGATIOND_DEBUG is set in the environment, verbose debug logging is enabled
+ */
+
 #include <stdio.h>                                                              // Standard I/O (fprintf, perror)
 #include <stdlib.h>                                                             // General utilities (exit, getenv)
 #include <stdint.h>                                                             // Fixed-width integer types (uint8_t, etc.)
@@ -91,6 +113,13 @@ static int mcp_write(uint8_t reg, uint8_t val) {
         syslog(LOG_ERR, "I2C write failed to reg 0x%02x: %s", reg, strerror(errno));
         return -1;
     }
+
+    // Debug logging for I2C write
+    if (g_debug) {
+        fprintf(stderr, "write[0x%02x] => 0x%02x\n", reg, val);
+        syslog(LOG_DEBUG, "write[0x%02x] => 0x%02x", reg, val);
+    }
+
     return 0;
 }
 
@@ -114,10 +143,12 @@ static int mcp_read(uint8_t reg, uint8_t *out) {
         return -1;
     }
 
+    // Debug logging for I2C read
     if (g_debug) {
         fprintf(stderr, "read[0x%02x] => 0x%02x\n", reg, *out);
         syslog(LOG_DEBUG, "read[0x%02x] => 0x%02x", reg, *out);
     }
+
     return 0;
 }
 
@@ -133,7 +164,6 @@ int mcp_map_zone(int zone, uint8_t *reg, uint8_t *mask) {
     if (zone >= 1 && zone <= 8) {
         *reg  = GPIOA;                                                          // Zones 1–8 map to GPIOA pins 0–7
         *mask = (uint8_t)(1u << (zone - 1));
-        syslog(LOG_DEBUG, "Zone %d mapped to GPIOA: reg 0x%02x, mask 0x%02x", zone, *reg, *mask);
         return 0;
     } else if (zone >= 9 && zone <= 14) {
         *reg = GPIOB;                                                           // Zones 9–14 map to GPIOB pins 5–0
@@ -142,10 +172,8 @@ int mcp_map_zone(int zone, uint8_t *reg, uint8_t *mask) {
             (1u << 2), (1u << 1), (1u << 0)
         };
         *mask = bmap[zone - 9];
-        syslog(LOG_DEBUG, "Zone %d mapped to GPIOB: reg 0x%02x, mask 0x%02x", zone, *reg, *mask);
         return 0;
     } else {
-        syslog(LOG_ERR, "Invalid zone: %d", zone);
         return -1;                                                              // Invalid zone number
     }
 }
@@ -164,8 +192,13 @@ int mcp_set_zone_state(int zone, int on) {
     if (mcp_read(reg, &current_val) == 0) {
         uint8_t new_val = on ? (current_val | mask) : (current_val & ~mask);
 
-        syslog(LOG_DEBUG, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)", zone,
-               on ? "ON" : "OFF", current_val, new_val, reg);
+        if (g_debug) {
+            fprintf(stderr, "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)\n",
+                    zone, on ? "ON" : "OFF", current_val, new_val, reg);
+            syslog(LOG_DEBUG,
+                   "zone %d -> %s: 0x%02x -> 0x%02x (reg 0x%02x)",
+                   zone, on ? "ON" : "OFF", current_val, new_val, reg);
+        }
 
         rc = mcp_write(reg, new_val);
         if (rc != 0) {
