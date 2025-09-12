@@ -9,6 +9,7 @@ ExecStart=/usr/local/bin/irrigationd
 # Required environment variables
 Environment=IRRIGATIOND_TOKEN=changeme-very-secret-token
 Environment=IRRIGATIOND_BIND_ADDR=0.0.0.0
+Environment=IRRIGATIOND_LOG_LEVEL=debug
 
 # Run as irrigationd user (remove if you want to test as root first)
 User=irrigationd
